@@ -1,0 +1,39 @@
+# Binaries (go build -o …)
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/dist/
+
+# Test & coverage
+*.test
+*.out
+coverage.out
+coverage.html
+*.prof
+cpu.prof
+mem.prof
+
+# Go workspace / vendor (if used)
+vendor/
+
+# macOS
+.DS_Store
+**/.DS_Store
+/.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
