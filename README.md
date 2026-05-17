@@ -100,21 +100,21 @@ Results measured on **Apple M-series (ARM64)**, Go 1.22, gnark v0.10.
 
 ### Mode 2 — Full TLS-PRF pipeline
 
-CRS setup: **~378,000 ms one-time** (reused for all rows below)
+CRS setup: **340,295 ms one-time** (reused for all rows below)
 R1CS constraints: **1,370,734**
 
 ```
-Config       RC (ms)   Attest (ms)   Sign (ms)   Total (ms)
-────────────────────────────────────────────────────────────
-2-of-3             5        15,409           2       15,416
-3-of-5            11        16,535           4       16,550
-5-of-9            20        15,929           9       15,958
-7-of-13           37        15,160          16       15,213
-10-of-19          73        14,976          34       15,083
-15-of-29         212        15,082          61       15,355
-20-of-39         426        14,377         106       14,909
-30-of-59       1,540        14,435         221       16,196
-50-of-99       8,538        15,785         923       25,246
+Config       RC (ms)   Attest (ms)   Sign (ms)   OnChain (ms)   Total (ms)
+────────────────────────────────────────────────────────────────────────────
+2-of-3             5        13,839           2              0       13,846
+3-of-5             9        14,173           4              0       14,186
+5-of-9            20        14,076          10              0       14,106
+7-of-13           38        14,086          16              0       14,140
+10-of-19          75        14,262          31              0       14,368
+15-of-29         192        14,284          67              0       14,543
+20-of-39         429        14,246         107              0       14,782
+30-of-59       1,522        14,187         251              0       15,960
+50-of-99       8,411        14,256         626              0       23,293
 ```
 
 Column definitions:
@@ -123,14 +123,14 @@ Column definitions:
 - **Sign** — FROST: DKG Reload + Round1 + Round2 + VerifySignatureShare + Aggregate + Verify
 - **OnChain** — SC.Verify(σ, pk) Go simulation (~0ms, real cost on-chain ~3,272 gas)
 
-**Attest is O(1) in n** — 15,409 ms at 2-of-3, 15,785 ms at 50-of-99.
+**Attest is O(1) in n** — 13,839 ms at 2-of-3, 14,256 ms at 50-of-99 (2.7% variance).
 This confirms paper Theorem 1: prover complexity is independent of committee size.
 
 **RC scales with n** — Feldman VSS runs a genuine t-of-n DKG (O(n²·t) verification,
-parallelised with goroutines). RC at 50-of-99 is 8,538 ms.
+parallelised with goroutines). RC at 50-of-99 is 8,411 ms.
 
 **Sign uses DKG Reload (paper §V)** — FROST signers are constructed from the DVRF
-key material; a second DKG is never run. Sign at 50-of-99 is 923 ms.
+key material; a second DKG is never run. Sign at 50-of-99 is 626 ms.
 
 ---
 
@@ -162,11 +162,11 @@ compared to the paper's reference version.
 
 | Metric | Rust (ark 0.2 / BLS12-377) | Go (gnark / BLS12-381) | Note |
 |---|---|---|---|
-| CRS setup | 188,824 ms | ~378,000 ms | Rust 2× faster (SIMD) |
-| Attest 2-of-3 | 29,359 ms | 15,409 ms | **Go 1.9× faster** |
-| Attest 50-of-99 | 29,411 ms | 15,785 ms | **Go 1.9× faster** |
-| RC 50-of-99 | 33,458 ms | 8,538 ms | Both run real distributed DKG |
-| Sign 50-of-99 | 64 ms | 923 ms | Rust has hand-optimised secp256k1 asm |
+| CRS setup | 188,824 ms | 340,295 ms | Rust 1.8× faster (SIMD) |
+| Attest 2-of-3 | 29,359 ms | 13,839 ms | **Go 2.1× faster** |
+| Attest 50-of-99 | 29,411 ms | 14,256 ms | **Go 2.1× faster** |
+| RC 50-of-99 | 33,458 ms | 8,411 ms | Both run real distributed DKG |
+| Sign 50-of-99 | 64 ms | 626 ms | Rust has hand-optimised secp256k1 asm |
 | Mode 2 R1CS | 1,719,598 | 1,370,734 | Go −20.3% (gnark v0.10 SHA256) |
 
 **Key observations:**
