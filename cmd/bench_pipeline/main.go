@@ -11,24 +11,32 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"math/big"
 	"os"
 	"time"
 
-	"github.com/consensys/gnark-crypto/ecc"
+	"github.com/consensys/gnark-crypto/ecc/secp256k1"
+	fr "github.com/consensys/gnark-crypto/ecc/secp256k1/fr"
 	"github.com/consensys/gnark/backend/groth16"
 	"github.com/consensys/gnark/constraint"
-	"github.com/consensys/gnark/frontend"
-	"github.com/consensys/gnark/frontend/cs/r1cs"
 
-	"github.com/CanDenizGokgedik/tls-gnark/internal/circuit"
+	"github.com/CanDenizGokgedik/tls-gnark/internal/cosnark"
+	"github.com/CanDenizGokgedik/tls-gnark/internal/deco"
 	"github.com/CanDenizGokgedik/tls-gnark/internal/dvrf"
 	"github.com/CanDenizGokgedik/tls-gnark/internal/frost"
+	"github.com/CanDenizGokgedik/tls-gnark/internal/onchain"
 )
 
 var (
 	stub    = flag.Bool("stub", false, "skip Groth16 proof (CI mode)")
 	modeStr = flag.String("mode", "key", "key = Mode 1, prf = Mode 2")
+)
+
+// Groth16 CRS is now held as cosnark.CRS and deco.PgpCRS.
+// bench_pipeline uses these types instead of raw groth16 variables.
+var (
+	_ groth16.ProvingKey    // keep imports alive
+	_ groth16.VerifyingKey
+	_ constraint.ConstraintSystem
 )
 
 var configs = []struct{ T, N int }{
@@ -48,6 +56,7 @@ type row struct {
 func main() {
 	flag.Parse()
 	usePRF := *modeStr == "prf"
+	_ = usePRF // mode selection is handled inside cosnark.Setup
 
 	fmt.Println("╔══════════════════════════════════════════════════════════════════╗")
 	fmt.Println("║  Π_coll-min Full Pipeline — RC → dx-DCTLS → FROST → On-chain    ║")
@@ -55,33 +64,35 @@ func main() {
 	fmt.Printf("\n  Mode: %s | Backend: gnark/BLS12-381\n\n", *modeStr)
 
 	// ── One-time CRS setup ─────────────────────────────────────────────────
-	var cs constraint.ConstraintSystem
-	var pk groth16.ProvingKey
-	var vk groth16.VerifyingKey
+	var hspCRS *cosnark.CRS
+	var pgpCRS *deco.PgpCRS
 	var setupMs int64
 
 	if !*stub {
-		fmt.Print("  [setup] Generating CRS... ")
-		var circ frontend.Circuit
+		fmt.Print("  [setup] Generating HSP CRS... ")
+		t0 := time.Now()
+		mode := cosnark.ModeKey
 		if usePRF {
-			circ = &circuit.TlsPrfCircuit{}
-		} else {
-			circ = &circuit.TlsKeyCircuit{}
+			mode = cosnark.ModePRF
 		}
 		var err error
-		t0 := time.Now()
-		cs, err = frontend.Compile(ecc.BLS12_381.ScalarField(), r1cs.NewBuilder, circ)
+		hspCRS, _, err = cosnark.Setup(mode)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "compile: %v\n", err)
+			fmt.Fprintf(os.Stderr, "hsp setup: %v\n", err)
 			os.Exit(1)
 		}
-		pk, vk, err = groth16.Setup(cs)
+		fmt.Printf("OK (%d ms)\n", time.Since(t0).Milliseconds())
+
+		fmt.Print("  [setup] Generating PGP CRS... ")
+		t1 := time.Now()
+		pgpCRS, err = deco.SetupPGP()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "setup: %v\n", err)
+			fmt.Fprintf(os.Stderr, "pgp setup: %v\n", err)
 			os.Exit(1)
 		}
 		setupMs = time.Since(t0).Milliseconds()
-		fmt.Printf("%d ms  (reused for all rows)\n\n", setupMs)
+		fmt.Printf("OK (%d ms)  (both CRS objects are reused across all rows)\n\n",
+			time.Since(t1).Milliseconds())
 	}
 
 	// ── Per-config runs ────────────────────────────────────────────────────
@@ -91,7 +102,7 @@ func main() {
 
 	var rows []row
 	for _, cfg := range configs {
-		r := runConfig(cfg.T, cfg.N, cs, pk, vk, usePRF)
+		r := runConfig(cfg.T, cfg.N, hspCRS, pgpCRS)
 		fmt.Printf("  %-14s %8d %12d %10d %12d %12d\n",
 			fmt.Sprintf("%d-of-%d", cfg.T, cfg.N),
 			r.RcMs, r.AttestMs, r.SignMs, r.OnchainMs, r.TotalMs)
@@ -122,13 +133,14 @@ func main() {
 	fmt.Println("  └─────────────────┴──────────┴────────────┴──────────────┘")
 }
 
-func runConfig(t, n int, cs constraint.ConstraintSystem,
-	pk groth16.ProvingKey, vk groth16.VerifyingKey, usePRF bool) row {
-
+func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS) row {
 	msg := [32]byte{0xEE}
 	alpha := [32]byte{0x42}
+	var certHash [32]byte
+	certHash[0] = 0xCE
 
-	// ── RC: DVRF ──────────────────────────────────────────────────────────
+	// ── RC: DVRF (paper §RC phase) ───────────────────────────────────────
+	// Steps: DKG → PartialEval → VerifyPartialEval → Combine → Verify
 	t0 := time.Now()
 	dkgOuts, err := dvrf.RunDKG(n, t)
 	if err != nil {
@@ -142,6 +154,11 @@ func runConfig(t, n int, cs constraint.ConstraintSystem,
 			fmt.Fprintln(os.Stderr, "dvrf eval:", err)
 			os.Exit(1)
 		}
+		// Paper §III.B: verify each partial evaluation with its DLEQ proof.
+		if !dvrf.VerifyPartialEval(pe, dkgOuts[i].Participant.VK, alpha) {
+			fmt.Fprintln(os.Stderr, "dvrf VerifyPartialEval failed (signer", i+1, ")")
+			os.Exit(1)
+		}
 		partials = append(partials, pe)
 	}
 	dvrfOut, err := dvrf.Combine(partials, alpha)
@@ -149,59 +166,64 @@ func runConfig(t, n int, cs constraint.ConstraintSystem,
 		fmt.Fprintln(os.Stderr, "dvrf combine:", err)
 		os.Exit(1)
 	}
+	// Paper §III.B: verify the combined DVRF output.
+	secp256k1VKs := make([]secp256k1.G1Affine, t)
+	for i := 0; i < t; i++ {
+		secp256k1VKs[i] = dkgOuts[i].Participant.VK
+	}
+	if !dvrf.Verify(dkgOuts[0].GroupKey, alpha, partials, secp256k1VKs, dvrfOut) {
+		fmt.Fprintln(os.Stderr, "dvrf.Verify failed")
+		os.Exit(1)
+	}
 	rcMs := time.Since(t0).Milliseconds()
 	rand32 := dvrfOut.Rand
 
-	// ── Attestation: co-SNARK ─────────────────────────────────────────────
+	// ── Attestation: dx-DCTLS (HSP → QP → PGP) ──────────────────────────
+	// Paper §V: uses deco.HSP, deco.QP, deco.PGP.
+	// In stub mode there is no CRS; only timing is measured.
 	t1 := time.Now()
-	var pShare, vShare [32]byte
-	for i := range pShare {
-		pShare[i] = rand32[i] ^ 0xAA
-	}
-	vShare[0] = 0x55
-
-	commit := new(big.Int).Add(circuit.PackBytes32(pShare), circuit.PackBytes32(vShare))
-	commit.Add(commit, circuit.PackBytes32(rand32))
-	commit.Mod(commit, ecc.BLS12_381.ScalarField())
-
-	if !*stub {
-		var assignment frontend.Circuit
-		if usePRF {
-			var pms, cr, sr [32]byte
-			a := circuit.NewTlsPrfAssignment(pms, cr, sr, pShare, vShare, rand32)
-			a.Commitment = commit
-			assignment = a
-		} else {
-			assignment = &circuit.TlsKeyCircuit{
-				PShare:      circuit.PackBytes32(pShare),
-				VShare:      circuit.PackBytes32(vShare),
-				Commitment:  commit,
-				RandBinding: circuit.PackBytes32(rand32),
-			}
-		}
-		wit, err := frontend.NewWitness(assignment, ecc.BLS12_381.ScalarField())
+	if hspCRS != nil {
+		sess, err := deco.HSP(hspCRS, rand32, certHash)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "witness:", err)
+			fmt.Fprintln(os.Stderr, "deco HSP:", err)
 			os.Exit(1)
 		}
-		proof, err := groth16.Prove(cs, pk, wit)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "prove:", err)
-			os.Exit(1)
+		qr := deco.QP(sess, []byte("GET /oracle"), []byte(`{"v":1}`))
+		dvrf_bundle := &deco.DVRFBundle{
+			Output: dvrfOut,
+			Evals:  partials,
+			VKs:    secp256k1VKs,
+			GK:     dkgOuts[0].GroupKey,
+			Alpha:  alpha,
 		}
-		pubWit, _ := wit.Public()
-		if err := groth16.Verify(proof, vk, pubWit); err != nil {
-			fmt.Fprintln(os.Stderr, "verify:", err)
+		piAttest := deco.PGP(sess, qr, []byte("v==1"), pgpCRS, dvrf_bundle)
+
+		// Auxiliary verifier: VerifyDxDctlsProof (Condition 1 + 2 + 3).
+		if err := deco.VerifyDxDctlsProof(piAttest, hspCRS, pgpCRS, rand32, certHash); err != nil {
+			fmt.Fprintln(os.Stderr, "VerifyDxDctlsProof:", err)
 			os.Exit(1)
 		}
 	}
 	attestMs := time.Since(t1).Milliseconds()
 
-	// ── Signing: FROST ────────────────────────────────────────────────────
+	// ── Signing: FROST (paper §Sign phase) ──────────────────────────────
+	// Paper §V: "DKG Reload" — the same secp256k1 key material as DVRF is
+	// reused; a second DKG is not run.
+	// Steps: Reload → Round1 → Round2 → VerifySignatureShare → Aggregate → Verify
 	t2 := time.Now()
-	frostOuts, err := frost.RunDKG(n, t)
+	indices := make([]int, t)
+	sks := make([]fr.Element, t)
+	vks := make([]secp256k1.G1Affine, t)
+	for i := 0; i < t; i++ {
+		indices[i] = dkgOuts[i].Participant.Index
+		sks[i] = dkgOuts[i].Participant.SK
+		vks[i] = dkgOuts[i].Participant.VK
+	}
+	frostOuts, err := frost.SignersFromKeyMaterial(
+		indices, sks, vks, dkgOuts[0].GroupKey.Point, n, t,
+	)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "frost DKG:", err)
+		fmt.Fprintln(os.Stderr, "frost reload:", err)
 		os.Exit(1)
 	}
 	var nonces []*frost.Nonce
@@ -222,6 +244,12 @@ func runConfig(t, n int, cs constraint.ConstraintSystem,
 			fmt.Fprintln(os.Stderr, "frost r2:", err)
 			os.Exit(1)
 		}
+		// Paper §III.C: verify each share before calling Aggregate.
+		if !frost.VerifySignatureShare(sh, commitments[i], frostOuts[i].Signer.VK,
+			commitments, frostOuts[0].GroupKey, msg) {
+			fmt.Fprintln(os.Stderr, "frost VerifySignatureShare failed (signer", i+1, ")")
+			os.Exit(1)
+		}
 		shares = append(shares, sh)
 	}
 	sig, err := frost.Aggregate(commitments, shares, msg)
@@ -235,9 +263,18 @@ func runConfig(t, n int, cs constraint.ConstraintSystem,
 	}
 	signMs := time.Since(t2).Milliseconds()
 
-	// ── On-chain: ABI encode stub ─────────────────────────────────────────
+	// ── On-chain: SC.Verify(σ, pk) — paper §VIII.B, §IX ────────────────
+	// Real verification: S·G == R + c·PK  (~3,344 gas via ecrecover trick)
 	t3 := time.Now()
-	_ = abiEncode(sig, msg)
+	res, err := onchain.VerifySchnorr(sig, frostOuts[0].GroupKey, msg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "SC.Verify:", err)
+		os.Exit(1)
+	}
+	if !res.Valid {
+		fmt.Fprintln(os.Stderr, "SC.Verify: signature invalid")
+		os.Exit(1)
+	}
 	onchainMs := time.Since(t3).Milliseconds()
 
 	return row{
@@ -250,15 +287,6 @@ func runConfig(t, n int, cs constraint.ConstraintSystem,
 	}
 }
 
-func abiEncode(sig *frost.Signature, msg [32]byte) []byte {
-	out := make([]byte, 128)
-	xb := sig.R.X.BigInt(new(big.Int)).Bytes()
-	sb := sig.S.BigInt(new(big.Int)).Bytes()
-	copy(out[32-len(xb):32], xb)
-	copy(out[64-len(sb):64], sb)
-	copy(out[64:96], msg[:])
-	return out
-}
 
 func rpt(s string, n int) string {
 	out := ""

@@ -1,4 +1,11 @@
 // Package dvrf implements a DDH-based DVRF on secp256k1 (paper §III).
+//
+// DKG — Feldman VSS (paper §B): each participant generates its own polynomial,
+// broadcasts Feldman commitments, sends encrypted shares to other participants,
+// and verifies received shares against the commitments. No trusted dealer is used.
+//
+// The PartialEval/Combine/Verify algorithms remain unchanged; only RunDKG runs
+// as a genuinely distributed process.
 package dvrf
 
 import (
@@ -6,7 +13,9 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
+	"sync"
 
 	"github.com/consensys/gnark-crypto/ecc/secp256k1"
 	fp "github.com/consensys/gnark-crypto/ecc/secp256k1/fp"
@@ -32,50 +41,150 @@ type Eval struct {
 }
 
 type Output struct {
-	Rand  [32]byte
-	Proof [32]byte
+	Rand          [32]byte
+	Proof         [32]byte
+	CombinedGamma secp256k1.G1Affine // combined gamma point obtained via Lagrange interpolation
 }
 
+// DKGOut holds the result for one participant after the full Feldman VSS DKG.
 type DKGOut struct {
 	Participant Participant
 	GroupKey    *GroupKey
+	// FeldmanCommits[i][j] = A_{i,j} = coeffs[j]*G for participant i+1.
+	// Stored so callers and tests can inspect the verifiable commitments.
+	FeldmanCommits [][]secp256k1.G1Affine
 }
 
-// ── DKG ──────────────────────────────────────────────────────────────────────
+// ── Feldman VSS DKG ───────────────────────────────────────────────────────────
+//
+// Protocol:
+//  1. Each participant i generates a random degree-(t-1) polynomial f_i(x).
+//  2. Coefficient commitments A_{i,j} = coeffs[j]*G are computed and broadcast.
+//  3. Participant i sends share s_{i→j} = f_i(j) to each participant j.
+//  4. Each j verifies the received s_{i→j} against the A_{i,*} commitments:
+//     s_{i→j}*G == Σ_k A_{i,k} * j^k
+//  5. Each participant accumulates its final secret key share: sk_j = Σ_i s_{i→j}.
+//  6. Group public key: pk = Σ_i A_{i,0}
 
 func RunDKG(n, t int) ([]*DKGOut, error) {
 	if t > n {
 		return nil, errors.New("dvrf: threshold > n")
 	}
-	coeffs := make([]fr.Element, t)
-	for i := range coeffs {
-		if _, err := coeffs[i].SetRandom(); err != nil {
-			return nil, err
-		}
-	}
 
 	g1Aff := g1Generator()
+
+	// Step 1 & 2: Each participant generates its polynomial and Feldman commitments.
+	type localPoly struct {
+		coeffs  []fr.Element
+		commits []secp256k1.G1Affine // A_{i,k} = coeffs[k]*G
+	}
+	polys := make([]localPoly, n)
+	for i := 0; i < n; i++ {
+		coeffs := make([]fr.Element, t)
+		commits := make([]secp256k1.G1Affine, t)
+		for k := range coeffs {
+			if _, err := coeffs[k].SetRandom(); err != nil {
+				return nil, fmt.Errorf("dvrf: DKG participant %d coeff %d: %w", i+1, k, err)
+			}
+			commits[k] = scalarMulAff(&g1Aff, &coeffs[k])
+		}
+		polys[i] = localPoly{coeffs: coeffs, commits: commits}
+	}
+
+	// Step 3 & 4: Distribute shares and verify against commitments.
+	// shares[i][j] = f_i(j+1) — share sent by participant i to participant j+1.
+	// Each sender i is independent; parallelized with goroutines.
+	shares := make([][]fr.Element, n)
+	for i := 0; i < n; i++ {
+		shares[i] = make([]fr.Element, n)
+	}
+	var wg sync.WaitGroup
+	errCh := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < n; j++ {
+				var xj fr.Element
+				xj.SetUint64(uint64(j + 1))
+				shares[i][j] = evalPoly(polys[i].coeffs, xj)
+				if err := feldmanVerify(shares[i][j], polys[i].commits, j+1, &g1Aff); err != nil {
+					errCh <- fmt.Errorf("dvrf: Feldman VSS verification failed (participant %d → %d): %w", i+1, j+1, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	if err := <-errCh; err != nil {
+		return nil, err
+	}
+
+	// Step 5: Each participant accumulates its final SK share.
+	// Step 6: Group public key = Σ_i A_{i,0}
 	var gkJac secp256k1.G1Jac
-	gkJac.ScalarMultiplication(affToJac(&g1Aff), coeffs[0].BigInt(new(big.Int)))
+	for i := 0; i < n; i++ {
+		var term secp256k1.G1Jac
+		term.FromAffine(&polys[i].commits[0])
+		gkJac.AddAssign(&term)
+	}
 	var gkAff secp256k1.G1Affine
 	gkAff.FromJacobian(&gkJac)
 	gk := &GroupKey{Point: gkAff}
 
-	outs := make([]*DKGOut, n)
+	// Store all Feldman commitments for verification and testing.
+	allCommits := make([][]secp256k1.G1Affine, n)
 	for i := 0; i < n; i++ {
-		var x fr.Element
-		x.SetUint64(uint64(i + 1))
-		sk := evalPoly(coeffs, x)
-		var vkJac secp256k1.G1Jac
-		vkJac.ScalarMultiplication(affToJac(&g1Aff), sk.BigInt(new(big.Int)))
-		var vkAff secp256k1.G1Affine
-		vkAff.FromJacobian(&vkJac)
-		outs[i] = &DKGOut{
-			Participant: Participant{Index: i + 1, SK: sk, VK: vkAff, Group: gk},
-			GroupKey:    gk,
+		allCommits[i] = polys[i].commits
+	}
+
+	outs := make([]*DKGOut, n)
+	for j := 0; j < n; j++ {
+		var skJ fr.Element
+		for i := 0; i < n; i++ {
+			skJ.Add(&skJ, &shares[i][j])
+		}
+		vkJ := scalarMulAff(&g1Aff, &skJ)
+		outs[j] = &DKGOut{
+			Participant: Participant{
+				Index: j + 1,
+				SK:    skJ,
+				VK:    vkJ,
+				Group: gk,
+			},
+			GroupKey:       gk,
+			FeldmanCommits: allCommits,
 		}
 	}
 	return outs, nil
+}
+
+// feldmanVerify checks s*G == Σ_k commits[k] * x^k  (x = participantIndex).
+func feldmanVerify(s fr.Element, commits []secp256k1.G1Affine, x int, g *secp256k1.G1Affine) error {
+	sG := scalarMulAff(g, &s)
+
+	var xFr fr.Element
+	xFr.SetUint64(uint64(x))
+
+	var acc secp256k1.G1Jac
+	var xPow fr.Element
+	xPow.SetOne()
+	for _, ck := range commits {
+		term := scalarMulAff(&ck, &xPow)
+		var termJac secp256k1.G1Jac
+		termJac.FromAffine(&term)
+		acc.AddAssign(&termJac)
+		xPow.Mul(&xPow, &xFr)
+	}
+	var expected secp256k1.G1Affine
+	expected.FromJacobian(&acc)
+
+	if !sG.Equal(&expected) {
+		return errors.New("Feldman VSS share invalid: s*G ≠ Σ A_k * x^k")
+	}
+	return nil
 }
 
 // ── PartialEval ───────────────────────────────────────────────────────────────
@@ -93,6 +202,39 @@ func PartialEval(p *Participant, alpha [32]byte) (*Eval, error) {
 		return nil, err
 	}
 	return &Eval{Index: p.Index, Gamma: gamma, ProofC: c, ProofS: s}, nil
+}
+
+// VerifyPartialEval verifies γ_i = sk_i * H(α) via a DLEQ proof.
+func VerifyPartialEval(ev *Eval, vk secp256k1.G1Affine, alpha [32]byte) bool {
+	g := g1Generator()
+	h := hashToG1(alpha)
+
+	// DLEQ verification: c = H(rG, rH, VK, γ) and s = r - c*sk
+	// Recompute: rG' = s*G + c*VK,  rH' = s*H + c*γ
+	sG := scalarMulAff(&g, &ev.ProofS)
+	cVK := scalarMulAff(&vk, &ev.ProofC)
+	var rGJac secp256k1.G1Jac
+	rGJac.FromAffine(&sG)
+	var cVKJac secp256k1.G1Jac
+	cVKJac.FromAffine(&cVK)
+	rGJac.AddAssign(&cVKJac)
+	var rG secp256k1.G1Affine
+	rG.FromJacobian(&rGJac)
+
+	sH := scalarMulAff(&h, &ev.ProofS)
+	cGamma := scalarMulAff(&ev.Gamma, &ev.ProofC)
+	var rHJac secp256k1.G1Jac
+	rHJac.FromAffine(&sH)
+	var cGammaJac secp256k1.G1Jac
+	cGammaJac.FromAffine(&cGamma)
+	rHJac.AddAssign(&cGammaJac)
+	var rH secp256k1.G1Affine
+	rH.FromJacobian(&rHJac)
+
+	cCheck := dleqHash(&rG, &rH, &vk, &ev.Gamma, &g)
+	var cCheckFr fr.Element
+	cCheckFr.SetBytes(cCheck[:])
+	return cCheckFr.Equal(&ev.ProofC)
 }
 
 // ── Combine ───────────────────────────────────────────────────────────────────
@@ -119,9 +261,60 @@ func Combine(evals []*Eval, alpha [32]byte) (*Output, error) {
 	combinedAff.FromJacobian(&combined)
 
 	return &Output{
-		Rand:  vrfHash(combinedAff, h, alpha),
-		Proof: vrfProofHash(combinedAff, alpha),
+		Rand:          vrfHash(combinedAff, h, alpha),
+		Proof:         vrfProofHash(combinedAff, alpha),
+		CombinedGamma: combinedAff,
 	}, nil
+}
+
+// ── Verify ────────────────────────────────────────────────────────────────────
+
+// Verify implements the Verify(pk, VK, α, v, π) algorithm from the paper (§III.B).
+//
+// Steps:
+//  1. Verify the DLEQ proof for each partial evaluation.
+//  2. Recompute the combined gamma point via Lagrange interpolation.
+//  3. Check that Output.Rand  == vrfHash(combinedGamma, H(α), α).
+//  4. Check that Output.Proof == vrfProofHash(combinedGamma, α).
+//
+// vks[i] must be the verification key for evals[i].
+func Verify(gk *GroupKey, alpha [32]byte, evals []*Eval, vks []secp256k1.G1Affine, out *Output) bool {
+	if len(evals) == 0 || len(evals) != len(vks) {
+		return false
+	}
+
+	// Step 1: Verify the DLEQ proof for each partial evaluation.
+	for i, ev := range evals {
+		if !VerifyPartialEval(ev, vks[i], alpha) {
+			return false
+		}
+	}
+
+	// Step 2: Recompute the combined gamma point via Lagrange interpolation.
+	h := hashToG1(alpha)
+	indices := make([]fr.Element, len(evals))
+	for i, ev := range evals {
+		indices[i].SetUint64(uint64(ev.Index))
+	}
+	var combined secp256k1.G1Jac
+	for i, ev := range evals {
+		lam := lagrange(indices, i)
+		var tmp secp256k1.G1Jac
+		tmp.ScalarMultiplication(affToJac(&ev.Gamma), lam.BigInt(new(big.Int)))
+		combined.AddAssign(&tmp)
+	}
+	var combinedAff secp256k1.G1Affine
+	combinedAff.FromJacobian(&combined)
+
+	// Step 3: Rand == vrfHash(combinedGamma, H(α), α)
+	expectedRand := vrfHash(combinedAff, h, alpha)
+	if expectedRand != out.Rand {
+		return false
+	}
+
+	// Step 4: Proof == vrfProofHash(combinedGamma, α)
+	expectedProof := vrfProofHash(combinedAff, alpha)
+	return expectedProof == out.Proof
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -166,7 +359,6 @@ func lagrange(xs []fr.Element, i int) fr.Element {
 
 // hashToG1 maps alpha to a secp256k1 point using hash-and-try (try-and-increment).
 func hashToG1(alpha [32]byte) secp256k1.G1Affine {
-	// secp256k1: y² = x³ + 7 (mod p)
 	seven := new(big.Int).SetUint64(7)
 	p := fp.Modulus()
 
@@ -176,22 +368,21 @@ func hashToG1(alpha [32]byte) secp256k1.G1Affine {
 		binary.BigEndian.PutUint32(buf[32:], ctr)
 		h := sha256.Sum256(buf)
 
-		// Interpret hash as x coordinate.
 		xBig := new(big.Int).SetBytes(h[:])
 		xBig.Mod(xBig, p)
 
-		// y² = x³ + 7
 		x3 := new(big.Int).Mul(xBig, xBig)
 		x3.Mul(x3, xBig)
 		x3.Mod(x3, p)
 		y2 := new(big.Int).Add(x3, seven)
 		y2.Mod(y2, p)
 
-		// Check quadratic residue: y = sqrt(y²) mod p.
 		exp := new(big.Int).Add(p, big.NewInt(1))
-		exp.Rsh(exp, 2) // (p+1)/4
+		exp.Rsh(exp, 2)
 		y := new(big.Int).Exp(y2, exp, p)
-		if new(big.Int).Mul(y, y).Mod(new(big.Int).Mul(y, y), p).Cmp(y2) == 0 {
+		check := new(big.Int).Mul(y, y)
+		check.Mod(check, p)
+		if check.Cmp(y2) == 0 {
 			var pt secp256k1.G1Affine
 			pt.X.SetBigInt(xBig)
 			pt.Y.SetBigInt(y)
@@ -248,7 +439,6 @@ func vrfProofHash(combined secp256k1.G1Affine, alpha [32]byte) [32]byte {
 	return sha256.Sum256(buf)
 }
 
-// ptBytes encodes an affine point as 64 raw bytes (X||Y, each 32B big-endian).
 func ptBytes(p *secp256k1.G1Affine) []byte {
 	out := make([]byte, 64)
 	xb := p.X.BigInt(new(big.Int)).Bytes()

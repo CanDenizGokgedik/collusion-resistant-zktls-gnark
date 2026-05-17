@@ -105,6 +105,97 @@ func TestDKG_ThresholdGTN(t *testing.T) {
 	}
 }
 
+// ── VerifySignatureShare tests (paper §III.C) ────────────────────────────────
+
+func TestVerifySignatureShare_Valid(t *testing.T) {
+	outs, err := frost.RunDKG(3, 2)
+	if err != nil {
+		t.Fatalf("DKG: %v", err)
+	}
+	nonces := make([]*frost.Nonce, 2)
+	commitments := make([]*frost.Commitment, 2)
+	for i := 0; i < 2; i++ {
+		nonces[i], commitments[i], _ = frost.Round1(&outs[i].Signer)
+	}
+	shares := make([]*frost.SignatureShare, 2)
+	for i := 0; i < 2; i++ {
+		shares[i], _ = frost.Round2(&outs[i].Signer, nonces[i], commitments, message)
+	}
+
+	// Each share must be verified before Aggregate.
+	for i := 0; i < 2; i++ {
+		ok := frost.VerifySignatureShare(
+			shares[i], commitments[i], outs[i].Signer.VK,
+			commitments, outs[0].GroupKey, message,
+		)
+		if !ok {
+			t.Fatalf("VerifySignatureShare failed (signer %d)", i+1)
+		}
+	}
+	t.Log("VerifySignatureShare: all shares valid")
+}
+
+func TestVerifySignatureShare_InvalidShare_Fails(t *testing.T) {
+	outs, err := frost.RunDKG(3, 2)
+	if err != nil {
+		t.Fatalf("DKG: %v", err)
+	}
+	nonces := make([]*frost.Nonce, 2)
+	commitments := make([]*frost.Commitment, 2)
+	for i := 0; i < 2; i++ {
+		nonces[i], commitments[i], _ = frost.Round1(&outs[i].Signer)
+	}
+
+	// Signer 0 produces a valid share.
+	shares := make([]*frost.SignatureShare, 2)
+	shares[0], _ = frost.Round2(&outs[0].Signer, nonces[0], commitments, message)
+	shares[1], _ = frost.Round2(&outs[1].Signer, nonces[1], commitments, message)
+
+	// Corrupt signer 0's share (simulating a malicious signer).
+	var corruptShare frost.SignatureShare
+	corruptShare.Index = shares[0].Index
+	// Deliberately set Z to a wrong value.
+	corruptShare.Z.SetUint64(0xDEADBEEF)
+
+	ok := frost.VerifySignatureShare(
+		&corruptShare, commitments[0], outs[0].Signer.VK,
+		commitments, outs[0].GroupKey, message,
+	)
+	if ok {
+		t.Fatal("VerifySignatureShare should reject a corrupt share")
+	}
+	t.Log("VerifySignatureShare: corrupt share correctly rejected")
+}
+
+func TestFullProtocol_WithShareVerification(t *testing.T) {
+	outs, err := frost.RunDKG(5, 3)
+	if err != nil {
+		t.Fatalf("DKG: %v", err)
+	}
+	nonces := make([]*frost.Nonce, 3)
+	commitments := make([]*frost.Commitment, 3)
+	for i := 0; i < 3; i++ {
+		nonces[i], commitments[i], _ = frost.Round1(&outs[i].Signer)
+	}
+	shares := make([]*frost.SignatureShare, 3)
+	for i := 0; i < 3; i++ {
+		shares[i], _ = frost.Round2(&outs[i].Signer, nonces[i], commitments, message)
+		// Verify each share before Aggregate — paper §III.C flow.
+		if !frost.VerifySignatureShare(shares[i], commitments[i], outs[i].Signer.VK,
+			commitments, outs[0].GroupKey, message) {
+			t.Fatalf("VerifySignatureShare[%d] failed", i)
+		}
+	}
+	sig, err := frost.Aggregate(commitments, shares, message)
+	if err != nil {
+		t.Fatalf("Aggregate: %v", err)
+	}
+	if !frost.Verify(sig, outs[0].GroupKey, message) {
+		t.Fatal("Verify failed")
+	}
+	t.Log("3-of-5 + VerifySignatureShare: OK")
+}
+
 func BenchmarkFrost_10of19(b *testing.B) {
 	const thr, n = 10, 19
 	outs, _ := frost.RunDKG(n, thr)

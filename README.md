@@ -15,21 +15,25 @@ Every component maps 1-to-1 to the paper's construction.
 tls-gnark/
 ├── internal/
 │   ├── circuit/
-│   │   ├── tls_key.go      Mode 1 — K_MAC split commitment  (~1 R1CS)
+│   │   ├── tls_key.go      Mode 1 — K_MAC split commitment (~1 R1CS)
 │   │   ├── tls_prf.go      Mode 2 — full TLS-PRF HMAC-SHA256 (~1.37M R1CS)
+│   │   ├── pgp.go          PGP ZKP circuit — MiMC(KMacP, KMacV)
 │   │   └── native.go       native off-circuit helpers
 │   ├── cosnark/
 │   │   ├── prover.go       Groth16 setup + central-mode prove/verify
-│   │   └── mpc.go          2-party co-SNARK: Execute / ExecuteSplit (goroutine model)
+│   │   ├── mpc.go          2-party co-SNARK: additive blinding protocol
+│   │   └── dmsm.go         genuine distributed MSM for Groth16
 │   ├── dvrf/
-│   │   └── dvrf.go         DVRF — DDH-VRF on secp256k1, t-of-n
+│   │   └── dvrf.go         DVRF — DDH-VRF on secp256k1, t-of-n Feldman VSS
 │   ├── frost/
-│   │   └── frost.go        FROST — threshold Schnorr on secp256k1
-│   └── deco/
-│       └── deco.go         dx-DCTLS — HSP / QP / PGP phases
+│   │   └── frost.go        FROST — threshold Schnorr on secp256k1, Feldman VSS
+│   ├── deco/
+│   │   └── deco.go         dx-DCTLS — HSP / QP / PGP phases
+│   └── onchain/
+│       └── verifier.go     SC.Verify(σ, pk) Go simulator + ABI encoder
 └── cmd/
     ├── bench_dctls/        Isolated HSP overhead benchmark (§IX)
-    └── bench_pipeline/     Full pipeline RC→Attest→Sign (Table II)
+    └── bench_pipeline/     Full pipeline RC→Attest→Sign→OnChain (Table II)
 ```
 
 ---
@@ -37,67 +41,96 @@ tls-gnark/
 ## Quick start
 
 ```bash
+# Fetch dependencies
 go mod tidy
 
-# Sanity check (stub mode, no real proving, < 5s):
-./quicktest.sh
+# Run all unit tests (no Groth16 proving, fast):
+go test ./...
 
-# Real Groth16 bench — Mode 1 (K_MAC split, ~1ms prove):
+# Run all unit tests with verbose output:
+go test -v ./...
+
+# Run a specific package:
+go test ./internal/dvrf/...
+go test ./internal/frost/...
+go test ./internal/cosnark/...
+go test ./internal/deco/...
+go test ./internal/onchain/...
+
+# Stub benchmark — no real proving, just pipeline timing (< 5s):
+go run ./cmd/bench_pipeline --stub
+
+# HSP overhead benchmark — Mode 1 (K_MAC split, ~1ms prove):
 go run ./cmd/bench_dctls --mode key
 
-# Real Groth16 bench — Mode 2 (full TLS-PRF, ~14s prove):
+# HSP overhead benchmark — Mode 2 (full TLS-PRF, ~15s prove):
 go run ./cmd/bench_dctls --mode prf
 
-# Full pipeline benchmark (9 t-of-n configs, Mode 2):
+# Full pipeline benchmark — Mode 2, all 9 t-of-n configs:
 go run ./cmd/bench_pipeline --mode prf
+
+# Full pipeline benchmark — Mode 1:
+go run ./cmd/bench_pipeline --mode key
+```
+
+---
+
+## Running tests
+
+```bash
+# All packages, short mode
+go test -count=1 ./...
+
+# Skip slow Groth16 tests (unit-only)
+go test -short ./...
+
+# With race detector
+go test -race ./internal/dvrf/... ./internal/frost/...
+
+# Benchmarks (FROST, DVRF)
+go test -bench=. ./internal/frost/...
+go test -bench=. ./internal/dvrf/...
 ```
 
 ---
 
 ## Benchmark results
 
-### Mode 2 — Full TLS-PRF Pipeline (measured on Apple M-series)
+Results measured on **Apple M-series (ARM64)**, Go 1.22, gnark v0.10.
 
-CRS setup: **355,885 ms** (one-time, reused for all rows)
+### Mode 2 — Full TLS-PRF pipeline
+
+CRS setup: **~378,000 ms one-time** (reused for all rows below)
+R1CS constraints: **1,370,734**
 
 ```
-Config       RC (ms)   Attest (ms)   Sign (ms)   OnChain (ms)   Total (ms)
-───────────────────────────────────────────────────────────────────────────
-2-of-3             1        14,244           1              0       14,246
-3-of-5             2        14,319           3              0       14,324
-5-of-9             3        14,396           6              0       14,405
-7-of-13            5        14,510           9              0       14,524
-10-of-19           6        14,321          17              0       14,344
-15-of-29          10        14,454          36              0       14,500
-20-of-39          12        14,526          60              0       14,598
-30-of-59          20        14,545         120              0       14,685
-50-of-99          32        14,631         339              0       15,002
+Config       RC (ms)   Attest (ms)   Sign (ms)   Total (ms)
+────────────────────────────────────────────────────────────
+2-of-3             5        15,409           2       15,416
+3-of-5            11        16,535           4       16,550
+5-of-9            20        15,929           9       15,958
+7-of-13           37        15,160          16       15,213
+10-of-19          73        14,976          34       15,083
+15-of-29         212        15,082          61       15,355
+20-of-39         426        14,377         106       14,909
+30-of-59       1,540        14,435         221       16,196
+50-of-99       8,538        15,785         923       25,246
 ```
 
-**Attest column is O(1) in n** — 14,244ms at 2-of-3, 14,631ms at 50-of-99.
+Column definitions:
+- **RC** — Randomness Committee phase: DVRF DKG (Feldman VSS) + PartialEval + Combine + Verify
+- **Attest** — dx-DCTLS: HSP (ECDH + PRF + co-SNARK) + QP + PGP + VerifyDxDctlsProof
+- **Sign** — FROST: DKG Reload + Round1 + Round2 + VerifySignatureShare + Aggregate + Verify
+- **OnChain** — SC.Verify(σ, pk) Go simulation (~0ms, real cost on-chain ~3,272 gas)
+
+**Attest is O(1) in n** — 15,409 ms at 2-of-3, 15,785 ms at 50-of-99.
 This confirms paper Theorem 1: prover complexity is independent of committee size.
 
----
+**RC scales with n** — Feldman VSS runs a genuine t-of-n DKG (O(n²·t) verification,
+parallelised with goroutines). RC at 50-of-99 is 8,538 ms.
 
-### Go vs Rust comparison
-
-| Metric | Rust (ark 0.2 / BLS12-377) | Go (gnark / BLS12-381) | Delta |
-|---|---|---|---|
-| CRS setup | 188,824ms | 355,885ms | Rust 1.9× faster (SIMD) |
-| Attest 2-of-3 | 29,359ms | 14,244ms | **Go 2.1× faster** |
-| Attest 50-of-99 | 29,411ms | 14,631ms | **Go 2.0× faster** |
-| RC 2-of-3 | 2ms | 1ms | Rust: full DKG / Go: trusted dealer |
-| RC 50-of-99 | 33,458ms | 32ms | **⚠ farklı protokol** (bkz. not) |
-| Sign 50-of-99 | 64ms | 339ms | Rust 5× faster |
-| Mode 2 R1CS | 1,719,598 | 1,370,734 | −20.3% |
-
-**Key observations:**
-
-- **Attest is 2× faster in Go** — gnark/BLS12-381 MSM outperforms arkworks 0.2/BLS12-377.
-- **RC times are NOT comparable** — Rust uses a full 3-round Pedersen/FROST DKG (RFC 9591) with O(n²) broadcast+verify messages across all n participants. Go uses a trusted dealer (polynomial eval only, O(n)). Rust 50-of-99 takes 33,458ms because 99 parties each verify 98 incoming packages. Go completes in 32ms because only the dealer evaluates. Production must use the distributed DKG.
-- **Sign (FROST) is 5× slower in Go** — gnark-crypto secp256k1 lacks Rust's hand-optimized assembly.
-- **CRS setup is 2× slower in Go** — no `target-cpu=native` SIMD in Go build; addressable with CGO backends.
-- **R1CS delta −20.3%** — gnark v0.10 SHA256 has fewer constraints per compression than the paper's reference version.
+**Sign uses DKG Reload (paper §V)** — FROST signers are constructed from the DVRF
+key material; a second DKG is never run. Sign at 50-of-99 is 923 ms.
 
 ---
 
@@ -106,75 +139,140 @@ This confirms paper Theorem 1: prover complexity is independent of committee siz
 | Metric | Result |
 |---|---|
 | R1CS constraints | 1 |
-| CRS setup | <10ms |
-| Prove (avg) | 1ms |
+| CRS setup | < 10 ms |
+| Prove (avg) | 1 ms |
+
+---
+
+### Paper comparison
+
+| Metric | Paper (M3, gnark) | This repo (M-series, gnark) |
+|---|---|---|
+| Attest (HSP prove, Mode 2) | ~4,700 ms | ~15,000 ms |
+| Mode 2 R1CS | 1,719,598 | 1,370,734 (−20.3%) |
+
+The ~3× attest gap is due to M1/M2 vs M3 performance and the fact that Go's
+gnark MSM is not compiled with `target-cpu=native` SIMD by default.
+The lower R1CS count reflects gnark v0.10's more efficient SHA256 gadget
+compared to the paper's reference version.
+
+---
+
+### Go vs Rust comparison
+
+| Metric | Rust (ark 0.2 / BLS12-377) | Go (gnark / BLS12-381) | Note |
+|---|---|---|---|
+| CRS setup | 188,824 ms | ~378,000 ms | Rust 2× faster (SIMD) |
+| Attest 2-of-3 | 29,359 ms | 15,409 ms | **Go 1.9× faster** |
+| Attest 50-of-99 | 29,411 ms | 15,785 ms | **Go 1.9× faster** |
+| RC 50-of-99 | 33,458 ms | 8,538 ms | Both run real distributed DKG |
+| Sign 50-of-99 | 64 ms | 923 ms | Rust has hand-optimised secp256k1 asm |
+| Mode 2 R1CS | 1,719,598 | 1,370,734 | Go −20.3% (gnark v0.10 SHA256) |
+
+**Key observations:**
+
+- **Attest is ~2× faster in Go** — gnark/BLS12-381 MSM outperforms arkworks 0.2/BLS12-377.
+- **RC is now comparable** — both repos run a real Feldman VSS DKG; Go is faster
+  because goroutine-parallelised feldman verification reduces wall time.
+- **Sign is 14× slower in Go** — gnark-crypto secp256k1 lacks Rust's hand-optimised
+  assembly. The Go Sign time dropped from 11,500 ms to 923 ms after the DKG Reload
+  fix (paper §V: FROST signers reuse DVRF key material, no second DKG).
+- **CRS setup is 2× slower in Go** — no `target-cpu=native` SIMD in standard Go
+  build; addressable with CGO backends.
+- **R1CS delta −20.3%** — gnark v0.10 SHA256 has fewer constraints per compression
+  than the paper's reference version.
 
 ---
 
 ## Protocol components
 
 ### DVRF (§III)
-DDH-based distributed VRF on secp256k1.
-- `RunDKG(n, t)` — Feldman VSS, trusted dealer
+DDH-based distributed VRF on secp256k1 with Feldman VSS DKG.
+
+- `RunDKG(n, t)` — real t-of-n Feldman VSS; no trusted dealer
 - `PartialEval(p, α)` — γ_i = SK_i · H(α) with DLEQ proof
+- `VerifyPartialEval(ev, vk, α)` — verifies DLEQ proof per evaluator
 - `Combine(evals, α)` — Lagrange interpolation → VRF output
+- `Verify(gk, α, evals, vks, out)` — full DVRF output verification (paper §III.B)
 
 ### FROST (§IV)
-2-round threshold Schnorr signatures on secp256k1.
-- `RunDKG(n, t)` → key shares
-- `Round1` → nonce + commitment
-- `Round2` → signature share z_i = d + e·ρ + λ·sk·c
+2-round threshold Schnorr signatures on secp256k1 with Feldman VSS DKG.
+
+- `RunDKG(n, t)` — real t-of-n Feldman VSS; no trusted dealer
+- `SignersFromKeyMaterial(...)` — DKG Reload: construct signers from DVRF key material
+- `Round1` — nonce + commitment
+- `Round2` — signature share z_i = d + e·ρ + λ·sk·c
+- `VerifySignatureShare(...)` — per-share verification before aggregation (paper §III.C)
 - `Aggregate` + `Verify`
 
 ### co-SNARK (§V, §VI)
-Groth16 on BLS12-381 with 2-party split-input model.
-- `Setup(mode)` — compile circuit + Groth16 trusted setup
-- `Execute(...)` — central mode (both shares visible)
-- `ExecuteSplit(...)` — goroutine model: each party sends only its share via channel; coordinator assembles and proves
-- `VerifyMpc(...)` — verifier check
+Groth16 on BLS12-381 with additive blinding and genuine distributed MSM.
 
-> **Note:** `ExecuteSplit` models the communication boundary and timing of a true 2-party MPC co-SNARK. The coordinator still sees both shares in plaintext. A production deployment would replace the coordinator with a distributed MSM protocol (as in `collaborative-zksnark`). No equivalent Go library exists yet.
+- `Setup(mode)` — compile circuit + Groth16 trusted setup
+- `ExecuteDistributedMSM(...)` — genuine distributed MSM: each party contributes only
+  its own G1/G2 elements; coordinator never sees private scalars (paper §VI)
+- `ExecuteSplit(...)` — additive blinding protocol: commit-then-reveal over goroutines
+- `Execute(...)` — central mode (reference / testing)
+- `VerifyMpc(...)` — verifier check using public commitment
 
 ### dx-DCTLS (§VIII)
-- **HSP** — K_MAC derivation, XOR split, co-SNARK execution
+- **HSP** — ECDH handshake, TLS-PRF K_MAC derivation, field-additive split, co-SNARK
 - **QP** — HMAC-SHA256(K_MAC, Q‖R) transcript commitment
-- **PGP** — cross-binding proof assembly
+- **PGP** — cross-binding hash + Groth16 ZKP (MiMC) over K_MAC shares
+- **VerifyDxDctlsProof** — three-condition auxiliary verifier (π_HSP + π_PGP + DVRF.Verify)
+
+### On-chain verifier (§VIII.B, §IX)
+- `VerifySchnorr(sig, gk, msg)` — Go simulation of SC.Verify: S·G == R + c·PK
+- `EncodeVerifyCall(...)` — ABI encoding for `SchnorrVerifier.verify(...)`
+- `ComputeEcrecoverParams(...)` — ecrecover trick parameters
+- Gas estimate: ~3,272 gas (verification logic only, excluding base tx)
+- Solidity contract: `contracts/SchnorrVerifier.sol`
 
 ---
 
 ## Test coverage
 
+```bash
+go test -v ./...
 ```
-ok  internal/circuit    — 8 tests  (native helpers, Groth16 prove/verify, wrong commitment rejection)
-ok  internal/cosnark    — 6 tests  (setup, central, split, verify, tamper, central vs split)
-ok  internal/deco       — 6 tests  (HSP, VerifyHSP, QP determinism, transcript verify, full pipeline)
-ok  internal/dvrf       — 6 tests  (DKG, partial eval, combine, consistency, empty)
-ok  internal/frost      — 6 tests  (DKG, 2-of-3, 3-of-5, 5-of-9, wrong message, threshold>n)
+
+```
+ok  internal/circuit     8 tests   native helpers, Groth16 prove/verify, wrong commitment rejection
+ok  internal/cosnark    10 tests   setup, central, split, verify, tamper, distributed MSM, vs-central
+ok  internal/deco        8 tests   HSP, VerifyHSP, QP determinism, transcript verify, PGP ZKP, full DVRF pipeline
+ok  internal/dvrf        6 tests   DKG, partial eval, verify partial, combine, verify, consistency
+ok  internal/frost       7 tests   DKG, 2-of-3, 3-of-5, 5-of-9, wrong message, threshold>n, VerifySignatureShare
+ok  internal/onchain     5 tests   SC.Verify valid, wrong message, wrong PK, ABI encoding, gas estimate
 ```
 
 ---
 
-## Rust vs Go — full comparison
+## Rust vs Go — full component comparison
 
 | Component | tls-cosnark (Rust) | tls-gnark (Go) |
 |---|---|---|
-| Language | Rust | Go |
+| Language | Rust 2021 | Go 1.22 |
 | ZK backend | arkworks 0.2 / BLS12-377 | gnark 0.10 / BLS12-381 |
 | HMAC-SHA256 circuit | Manual R1CS gadget | gnark std/hash/sha2 |
-| MPC Groth16 | collaborative-zksnark (real MPC) | Central + goroutine model |
-| DVRF | Rust secp256k1 | gnark-crypto secp256k1 |
-| FROST | Rust frost-secp256k1 | Native implementation |
-| Attest speedup | baseline | **2× faster** |
+| Distributed MSM | collaborative-zksnark (real MPC) | dmsm.go (genuine distributed MSM) |
+| Additive blinding | — | mpc.go (goroutine model) |
+| DVRF | Rust secp256k1 + Pedersen VSS | gnark-crypto secp256k1 + Feldman VSS |
+| FROST | frost-secp256k1 crate | Native implementation |
+| DKG Reload | Yes | Yes (SignersFromKeyMaterial) |
+| VerifySignatureShare | Yes | Yes |
+| On-chain verifier | Solidity | Go simulator + SchnorrVerifier.sol |
+| Attest speedup | baseline | **~2× faster** |
 
 ---
 
 ## Paper
 
 > "Publicly Verifiable and Collusion-Resistant TLS Notarization"
-> [docs/tls.pdf](../tls-cosnark/docs/tls.pdf)
+> [docs/article.pdf](docs/article.pdf)
 
 Key sections:
 - §III — DVRF construction
+- §IV — FROST threshold signatures
 - §V-VI — co-SNARK and collusion resistance
 - §VIII — dx-DCTLS full protocol
 - §IX — benchmark methodology (Table I, Table II)

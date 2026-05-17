@@ -1,6 +1,8 @@
 package circuit
 
 import (
+	"math/big"
+
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/std/hash/sha2"
 	"github.com/consensys/gnark/std/math/uints"
@@ -52,15 +54,24 @@ type TlsPrfCircuit struct {
 }
 
 // Define implements frontend.Circuit.
+//
+// Critical binding note:
+//   The Phase 1 output (master secret = TLS-PRF(PMS,"master secret"||CR||SR)[0:32])
+//   is bound to the K_MAC split:
+//     pack(P1H2_output) == PShare + VShare
+//   Without this, the prover could supply arbitrary shares unrelated to TLS-PRF.
 func (c *TlsPrfCircuit) Define(api frontend.API) error {
-	// Phase 1
+	// Phase 1: master secret derivation
 	if _, err := runHMAC(api, c.P1H1IKey[:], c.P1H1OKey[:], c.P1H1Msg[:]); err != nil {
 		return err
 	}
-	if _, err := runHMAC(api, c.P1H2IKey[:], c.P1H2OKey[:], c.P1H2Msg[:]); err != nil {
+	// P1H2 output = TLS-PRF master secret = K_MAC base (before rand binding)
+	kMacBytes, err := runHMAC(api, c.P1H2IKey[:], c.P1H2OKey[:], c.P1H2Msg[:])
+	if err != nil {
 		return err
 	}
-	// Phase 2
+
+	// Phase 2: key expansion (full PRF output; K_MAC is the P1H2 output)
 	if _, err := runHMAC(api, c.P2A0IKey[:], c.P2A0OKey[:], c.P2A0Msg[:]); err != nil {
 		return err
 	}
@@ -75,10 +86,32 @@ func (c *TlsPrfCircuit) Define(api frontend.API) error {
 			return err
 		}
 	}
-	// K_MAC binding
-	kMac := api.Add(c.PShare, c.VShare)
-	api.AssertIsEqual(c.Commitment, api.Add(kMac, c.RandBinding))
+
+	// ── Critical binding: TLS-PRF output → K_MAC split ───────────────────
+	// kMacBase = pack(P1H2_output)  [big-endian, 32 bytes → Fr element]
+	kMacBaseFe := packU8ToField(api, kMacBytes)
+	// RandBinding is passed as a rand32 field element from deco.HSP.
+	// kMac (field) = kMacBase + RandBinding  (Fr addition instead of XOR)
+	kMacFe := api.Add(kMacBaseFe, c.RandBinding)
+	// K_MAC split binding: kMac == PShare + VShare
+	kMacFromShares := api.Add(c.PShare, c.VShare)
+	api.AssertIsEqual(kMacFe, kMacFromShares)
+	// Commitment consistency: Commitment == PShare + VShare + RandBinding
+	api.AssertIsEqual(c.Commitment, api.Add(kMacFromShares, c.RandBinding))
 	return nil
+}
+
+// packU8ToField converts a 32-byte U8 array into a BLS12-381 Fr field element.
+// Encoding: big-endian (bytes[0] is the most significant byte).
+// Constraint count: ~32 multiplications + 32 additions (very efficient).
+func packU8ToField(api frontend.API, bytes []uints.U8) frontend.Variable {
+	result := frontend.Variable(0)
+	for i, b := range bytes {
+		// constant multiplier 2^(8*(31-i))
+		shift := new(big.Int).Lsh(big.NewInt(1), uint(8*(len(bytes)-1-i)))
+		result = api.Add(result, api.Mul(b.Val, shift))
+	}
+	return result
 }
 
 // runHMAC computes HMAC-SHA256 inside the circuit.
