@@ -66,11 +66,17 @@ go run ./cmd/bench_dctls --mode key
 # HSP overhead benchmark — Mode 2 (full TLS-PRF, ~15s prove):
 go run ./cmd/bench_dctls --mode prf
 
-# Full pipeline benchmark — Mode 2, all 9 t-of-n configs:
-go run ./cmd/bench_pipeline --mode prf
+# Full pipeline benchmark — LAN (no injected delay):
+go run ./cmd/bench_pipeline --mode prf --net lan
 
-# Full pipeline benchmark — Mode 1:
-go run ./cmd/bench_pipeline --mode key
+# Full pipeline benchmark — WAN1 (40 ms RTT, continental):
+go run ./cmd/bench_pipeline --mode prf --net wan1
+
+# Full pipeline benchmark — WAN2 (100 ms RTT, intercontinental):
+go run ./cmd/bench_pipeline --mode prf --net wan2
+
+# All three network conditions in one run (LAN → WAN1 → WAN2):
+go run ./cmd/bench_pipeline --mode prf --net all
 ```
 
 ---
@@ -123,7 +129,7 @@ Column definitions:
 - **Sign** — FROST: DKG Reload + Round1 + Round2 + VerifySignatureShare + Aggregate + Verify
 - **OnChain** — SC.Verify(σ, pk) Go simulation (~0ms, real cost on-chain ~3,272 gas)
 
-**Attest is O(1) in n** — 13,839 ms at 2-of-3, 14,256 ms at 50-of-99 (2.7% variance).
+**Attest is O(1) in n** — 13,839 ms at 3-of-5, 14,256 ms at 50-of-99 (2.7% variance).
 This confirms paper Theorem 1: prover complexity is independent of committee size.
 
 **RC scales with n** — Feldman VSS runs a genuine t-of-n DKG (O(n²·t) verification,
@@ -131,6 +137,46 @@ parallelised with goroutines). RC at 50-of-99 is 8,411 ms.
 
 **Sign uses DKG Reload (paper §V)** — FROST signers are constructed from the DVRF
 key material; a second DKG is never run. Sign at 50-of-99 is 626 ms.
+
+---
+
+### Network simulation — WAN1 (40 ms RTT) and WAN2 (100 ms RTT)
+
+The `--net` flag injects artificial one-way latency at every real communication
+boundary in the protocol. Round counts used:
+
+| Phase | Protocol rounds | One-way hops |
+|---|---|---|
+| DVRF DKG (Feldman VSS) | 3 broadcast rounds | 6 |
+| DVRF PartialEval (parallel) | 1 RTT | 2 |
+| TLS handshake inside HSP | 2 RTTs (TLS 1.2) | 4 |
+| co-SNARK ExecuteSplit | commit + reveal (2 RTTs) | 4 |
+| QP query + oracle response | 1 RTT | 2 |
+| FROST Round1 broadcast | 1 RTT | 2 |
+| FROST Round2 broadcast | 1 RTT | 2 |
+
+WAN1 injects **22 × 20 ms = 440 ms** per config row.
+WAN2 injects **22 × 50 ms = 1,100 ms** per config row.
+
+Since Attest (~14 s) dominates, the WAN overhead is <8% of total time — confirming
+that Π_coll-min's O(1) prover complexity holds even under realistic WAN conditions.
+
+---
+
+### DECO-DON baseline
+
+DECO-DON (arXiv:1909.00938, Table 2) runs n notary nodes **sequentially**:
+
+| Per-notary component | LAN | WAN1 | WAN2 |
+|---|---|---|---|
+| 3P Handshake | ~13,000 ms | ~14,000 ms | ~16,000 ms |
+| 2PC TLS-PRF | ~6,000 ms | ~7,000 ms | ~8,000 ms |
+| ZKP (upper bound) | ~13,000 ms | ~15,000 ms | ~18,000 ms |
+| **Total per notary** | **~32,000 ms** | **~36,000 ms** | **~42,000 ms** |
+
+For n=99 notaries: DECO-DON ≈ **3,168 s (LAN)** vs Π_coll-min ≈ **23 s** — a **~138× speedup**.
+
+Run with `--net all` to see the Speedup column for every (t,n) configuration.
 
 ---
 
