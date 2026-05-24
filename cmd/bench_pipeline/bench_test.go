@@ -17,6 +17,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -67,8 +72,17 @@ func TestMain(m *testing.M) {
 //	go test -run=TestBenchAll -v -timeout=60m ./cmd/bench_pipeline/...
 func TestBenchAll(t *testing.T) {
 	// ── Step 1: measure single DECO notary ──────────────────────────────
-	t.Log("Measuring single DECO notary time...")
-	singleDecoMs := measureSingleDeco(t)
+	// Try real DECO (jplaui/decoTls12MtE via Docker) first.
+	// Falls back to our own Groth16 prove time if Docker is unavailable.
+	t.Log("Attempting real DECO measurement via jplaui/decoTls12MtE...")
+	singleDecoMs := measureDecoBaseline(t)
+	decoSource := "jplaui/decoTls12MtE (real 3P-HS + 2PC + ZKP)"
+	if singleDecoMs == 0 {
+		t.Log("Docker unavailable or DECO build failed — using our Groth16 prove time as conservative lower bound.")
+		singleDecoMs = measureSingleDeco(t)
+		decoSource = "our HSP+QP+PGP Groth16 prove (conservative lower bound)"
+	}
+	t.Logf("DECO baseline source: %s", decoSource)
 	t.Logf("Single DECO notary: %d ms  →  DECO-DON(n) = n × %d ms", singleDecoMs, singleDecoMs)
 
 	// ── Step 2: run all pipeline configs ────────────────────────────────
@@ -145,12 +159,62 @@ func TestBenchAll(t *testing.T) {
 		"backend":           "gnark/BLS12-381",
 		"mode":              "prf",
 		"single_deco_ms":    singleDecoMs,
-		"deco_don_model":    "n × single_deco_ms (sequential)",
+		"deco_baseline_src": decoSource,
+		"deco_don_model":    "n × single_deco_ms (sequential notaries)",
 		"results":           jrows,
 	}
 	j, _ := json.MarshalIndent(out, "", "  ")
 	fmt.Println("\nJSON:")
 	fmt.Println(string(j))
+}
+
+// ── measureDecoBaseline ──────────────────────────────────────────────────────
+//
+// Attempts to run scripts/bench_deco.sh which clones jplaui/decoTls12MtE,
+// builds it via Docker, and runs the full 3-party DECO protocol.
+// Returns the measured ms, or 0 if Docker/git is unavailable or the script fails.
+// Callers fall back to measureSingleDeco() when this returns 0.
+func measureDecoBaseline(t testing.TB) int64 {
+	t.Helper()
+
+	// Locate scripts/bench_deco.sh relative to this source file.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Log("[deco-baseline] could not determine script path; skipping")
+		return 0
+	}
+	script := filepath.Join(filepath.Dir(thisFile), "..", "..", "scripts", "bench_deco.sh")
+	script, _ = filepath.Abs(script)
+
+	if _, err := os.Stat(script); err != nil {
+		t.Logf("[deco-baseline] script not found at %s; skipping", script)
+		return 0
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Log("[deco-baseline] docker not found; skipping external DECO measurement")
+		return 0
+	}
+
+	t.Logf("[deco-baseline] Running %s (first run builds Docker image ~30-45 min)...", script)
+	cmd := exec.Command("bash", script, "--runs", "1")
+	cmd.Stderr = os.Stderr
+	out, err := cmd.Output()
+	if err != nil {
+		t.Logf("[deco-baseline] script failed (%v); falling back to internal measurement", err)
+		return 0
+	}
+
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "DECO_SINGLE_MS=") {
+			ms, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "DECO_SINGLE_MS=")), 10, 64)
+			if err == nil && ms > 0 {
+				t.Logf("[deco-baseline] jplaui/decoTls12MtE measured: %d ms", ms)
+				return ms
+			}
+		}
+	}
+	t.Log("[deco-baseline] could not parse output; falling back to internal measurement")
+	return 0
 }
 
 // ── measureSingleDeco ────────────────────────────────────────────────────────

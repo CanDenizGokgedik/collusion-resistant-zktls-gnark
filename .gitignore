@@ -37,3 +37,4 @@ vendor/
 
 # Logs
 *.log
+.deco-baseline/

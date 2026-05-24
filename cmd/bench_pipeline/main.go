@@ -30,12 +30,9 @@ import (
 )
 
 var (
-	stub          = flag.Bool("stub", false, "skip Groth16 proof (CI mode)")
-	modeStr       = flag.String("mode", "key", "key = Mode 1, prf = Mode 2")
-	netMode       = flag.String("net", "lan", "network: lan | wan1 | wan2 | all")
-	decoSingleMs  = flag.Int64("deco-single-ms", 0,
-		"measured single-notary DECO time in ms (from BenchmarkDecoSingleNotary);\n"+
-			"overrides the hardcoded paper baseline when set")
+	stub    = flag.Bool("stub", false, "skip Groth16 proof (CI mode)")
+	modeStr = flag.String("mode", "key", "key = Mode 1, prf = Mode 2")
+	netMode = flag.String("net", "lan", "network: lan | wan1 | wan2 | all")
 )
 
 // keep imports alive
@@ -82,54 +79,14 @@ type row struct {
 	AttestMs  int64  `json:"attest_ms"`
 	SignMs    int64  `json:"sign_ms"`
 	OnchainMs int64  `json:"onchain_ms"`
-	NetMs     int64  `json:"net_ms"`   // total injected network delay
+	NetMs     int64  `json:"net_ms"` // total injected network delay
 	TotalMs   int64  `json:"total_ms"`
-	DecodonMs int64  `json:"decodon_ms"` // DECO-DON baseline (sequential n notaries)
 }
 
 type netResult struct {
 	Net     string `json:"net"`
 	SetupMs int64  `json:"setup_ms"`
 	Rows    []row  `json:"results"`
-}
-
-// ── DECO-DON baseline ─────────────────────────────────────────────────────────
-//
-// From DECO paper (arXiv:1909.00938) Table 2, WAN prover timing per notary:
-//   3P-HS:      ~13,000 ms
-//   2PC TLS-PRF: ~6,000 ms
-//   ZKP:        ~13,000 ms  (upper bound; scales with circuit size)
-// Total per notary: ~32,000 ms
-//
-// DECO-DON runs n notaries sequentially (no parallelism assumed).
-// For a (t,n) configuration with n notaries: n * decoPerNotaryMs.
-const decoPerNotaryLanMs = 32_000  // LAN reference from paper Table 2
-const decoPerNotaryWan1Ms = 36_000 // +4 s for WAN1 network overhead
-const decoPerNotaryWan2Ms = 42_000 // +10 s for WAN2 network overhead
-
-func decodonBaselineMs(n int, p netProfile) int64 {
-	// If --deco-single-ms was provided, use the measured value from
-	// BenchmarkDecoSingleNotary (same hardware, same circuit).
-	if *decoSingleMs > 0 {
-		perNotary := *decoSingleMs
-		// Add WAN overhead per notary: each notary's 3P-HS adds ~3 RTTs.
-		switch p.Name {
-		case "WAN1":
-			perNotary += 3 * 2 * netProfiles["wan1"].OneWay.Milliseconds()
-		case "WAN2":
-			perNotary += 3 * 2 * netProfiles["wan2"].OneWay.Milliseconds()
-		}
-		return int64(n) * perNotary
-	}
-	// Fallback: hardcoded values from DECO paper Table 2 (2019 hardware).
-	perNotary := int64(decoPerNotaryLanMs)
-	switch p.Name {
-	case "WAN1":
-		perNotary = decoPerNotaryWan1Ms
-	case "WAN2":
-		perNotary = decoPerNotaryWan2Ms
-	}
-	return int64(n) * perNotary
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -193,20 +150,16 @@ func main() {
 
 	for _, prof := range profiles {
 		fmt.Printf("  ══ Network: %s (one-way latency: %v) ══\n\n", prof.Name, prof.OneWay)
-		fmt.Printf("  %-14s %8s %12s %10s %10s %10s %14s %14s\n",
-			"Config", "RC(ms)", "Attest(ms)", "Sign(ms)", "Net(ms)", "Total(ms)",
-			"DECO-DON(ms)", "Speedup")
-		fmt.Println("  " + rpt("─", 100))
+		fmt.Printf("  %-14s %8s %12s %10s %10s %10s\n",
+			"Config", "RC(ms)", "Attest(ms)", "Sign(ms)", "Net(ms)", "Total(ms)")
+		fmt.Println("  " + rpt("─", 72))
 
 		var rows []row
 		for _, cfg := range configs {
 			r := runConfig(cfg.T, cfg.N, hspCRS, pgpCRS, prof)
-			r.DecodonMs = decodonBaselineMs(cfg.N, prof)
-			speedup := float64(r.DecodonMs) / float64(max1(r.TotalMs))
-			fmt.Printf("  %-14s %8d %12d %10d %10d %10d %14d  %8.1f×\n",
+			fmt.Printf("  %-14s %8d %12d %10d %10d %10d\n",
 				fmt.Sprintf("%d-of-%d", cfg.T, cfg.N),
-				r.RcMs, r.AttestMs, r.SignMs, r.NetMs, r.TotalMs,
-				r.DecodonMs, speedup)
+				r.RcMs, r.AttestMs, r.SignMs, r.NetMs, r.TotalMs)
 			rows = append(rows, r)
 		}
 		fmt.Println()
@@ -230,18 +183,7 @@ func main() {
 	fmt.Println("\nJSON:")
 	fmt.Println(string(j))
 
-	// ── Paper Table II summary ────────────────────────────────────────────
-	fmt.Println()
-	fmt.Println("  Paper Table II:")
-	fmt.Println("  ┌─────────────────┬──────────┬────────────┬──────────────┐")
-	fmt.Println("  │                 │   DECO   │  DECO-DON  │  Π_coll-min  │")
-	fmt.Println("  ├─────────────────┼──────────┼────────────┼──────────────┤")
-	fmt.Println("  │ Prover Complexity│  O(1)   │   O(n)     │    O(1) ←    │")
-	fmt.Println("  │ Public Verif.   │   No     │   Yes      │    Yes       │")
-	fmt.Println("  │ Collusion Res.  │   No     │   Yes      │    Yes       │")
-	fmt.Println("  │ Aux Node Load   │  N/A     │   Heavy    │  Lightweight │")
-	fmt.Println("  └─────────────────┴──────────┴────────────┴──────────────┘")
-}
+	}
 
 // ── runConfig ────────────────────────────────────────────────────────────────
 //
@@ -458,9 +400,3 @@ func rpt(s string, n int) string {
 	return out
 }
 
-func max1(a int64) int64 {
-	if a < 1 {
-		return 1
-	}
-	return a
-}
