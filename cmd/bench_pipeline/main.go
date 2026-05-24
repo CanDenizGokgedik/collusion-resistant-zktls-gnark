@@ -30,9 +30,12 @@ import (
 )
 
 var (
-	stub    = flag.Bool("stub", false, "skip Groth16 proof (CI mode)")
-	modeStr = flag.String("mode", "key", "key = Mode 1, prf = Mode 2")
-	netMode = flag.String("net", "lan", "network: lan | wan1 | wan2 | all")
+	stub          = flag.Bool("stub", false, "skip Groth16 proof (CI mode)")
+	modeStr       = flag.String("mode", "key", "key = Mode 1, prf = Mode 2")
+	netMode       = flag.String("net", "lan", "network: lan | wan1 | wan2 | all")
+	decoSingleMs  = flag.Int64("deco-single-ms", 0,
+		"measured single-notary DECO time in ms (from BenchmarkDecoSingleNotary);\n"+
+			"overrides the hardcoded paper baseline when set")
 )
 
 // keep imports alive
@@ -105,6 +108,20 @@ const decoPerNotaryWan1Ms = 36_000 // +4 s for WAN1 network overhead
 const decoPerNotaryWan2Ms = 42_000 // +10 s for WAN2 network overhead
 
 func decodonBaselineMs(n int, p netProfile) int64 {
+	// If --deco-single-ms was provided, use the measured value from
+	// BenchmarkDecoSingleNotary (same hardware, same circuit).
+	if *decoSingleMs > 0 {
+		perNotary := *decoSingleMs
+		// Add WAN overhead per notary: each notary's 3P-HS adds ~3 RTTs.
+		switch p.Name {
+		case "WAN1":
+			perNotary += 3 * 2 * netProfiles["wan1"].OneWay.Milliseconds()
+		case "WAN2":
+			perNotary += 3 * 2 * netProfiles["wan2"].OneWay.Milliseconds()
+		}
+		return int64(n) * perNotary
+	}
+	// Fallback: hardcoded values from DECO paper Table 2 (2019 hardware).
 	perNotary := int64(decoPerNotaryLanMs)
 	switch p.Name {
 	case "WAN1":
