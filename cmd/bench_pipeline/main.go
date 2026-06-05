@@ -74,13 +74,55 @@ func netSleep(p netProfile, oneWayHops int) {
 // ── Result types ──────────────────────────────────────────────────────────────
 
 type row struct {
-	Config    string `json:"config"`
-	RcMs      int64  `json:"rc_ms"`
-	AttestMs  int64  `json:"attest_ms"`
-	SignMs    int64  `json:"sign_ms"`
-	OnchainMs int64  `json:"onchain_ms"`
-	NetMs     int64  `json:"net_ms"` // total injected network delay
-	TotalMs   int64  `json:"total_ms"`
+	Config    string  `json:"config"`
+	DkgMs     int64   `json:"dkg_ms"`      // DKG setup (one-time per deployment)
+	RcSessMs  int64   `json:"rc_sess_ms"`  // PartialEval + Combine, no DKG
+	HspMs     int64   `json:"hsp_ms"`      // co-SNARK TLS-PRF proof
+	PgpMs     int64   `json:"pgp_ms"`      // DECO PGP ZKP proof
+	SignMs    int64   `json:"sign_ms"`     // FROST threshold signature
+	OnchainMs int64   `json:"onchain_ms"`  // on-chain verification
+	NetMs     int64   `json:"net_ms"`      // total injected network delay
+	TotalMs   int64   `json:"total_ms"`    // DKG + RcSess + Hsp + Pgp + Sign + Onchain
+	CommKB    float64 `json:"comm_kb"`     // analytical communication cost (KB)
+}
+
+// ── Communication cost model ──────────────────────────────────────────────────
+//
+// Follows the same element sizes as the companion Rust repo (DVRF-then-Sign):
+//
+//	DKG (n parties, t threshold) — per-participant average:
+//	  Round 1 (Feldman commitments, compressed secp256k1 G1):  2 × 33·t·(n-1) bytes
+//	  Round 2 (encrypted shares):                               2 × 80·(n-1)   bytes
+//	  Round 3 (verification responses):                         2 × 64·(n-1)   bytes
+//
+//	DVRF session (t evaluators) — per-participant:
+//	  partial_eval = 33 (G1 point) + 96 (proof gamma/delta) = 129 bytes
+//	  send 1, receive t-1  → 129·t total
+//
+//	FROST TSS (t signers) — per-participant:
+//	  Round 1 commitments: 66 bytes (2×33)  → 66·t
+//	  Round 2 signatures:  32 bytes (scalar) → 32·t + 64 (final sig)
+//
+//	ZKP proofs (Groth16 on BLS12-381):
+//	  co-SNARK (HSP): 192 bytes
+//	  PGP ZKP:        192 bytes
+//	  Total:          384 bytes
+func commCostKB(t, n int) (session float64, withDKG float64) {
+	// session-only (no DKG)
+	dvrfSession := float64(129 * t)
+	frostSession := float64(66*t) + float64(32*t) + 64
+	zkpProofs := float64(384)
+	sess := dvrfSession + frostSession + zkpProofs
+
+	// DKG per-participant average
+	dkgR1 := float64(2 * 33 * t * (n - 1))
+	dkgR2 := float64(2 * 80 * (n - 1))
+	dkgR3 := float64(2 * 64 * (n - 1))
+	dkg := dkgR1 + dkgR2 + dkgR3
+
+	session = sess / 1024
+	withDKG = (sess + dkg) / 1024
+	return
 }
 
 type netResult struct {
@@ -150,16 +192,16 @@ func main() {
 
 	for _, prof := range profiles {
 		fmt.Printf("  ══ Network: %s (one-way latency: %v) ══\n\n", prof.Name, prof.OneWay)
-		fmt.Printf("  %-14s %8s %12s %10s %10s %10s\n",
-			"Config", "RC(ms)", "Attest(ms)", "Sign(ms)", "Net(ms)", "Total(ms)")
-		fmt.Println("  " + rpt("─", 72))
+		fmt.Printf("  %-14s %8s %9s %8s %8s %8s %8s %10s %10s\n",
+			"Config", "DKG(ms)", "RCSess(ms)", "HSP(ms)", "PGP(ms)", "Sign(ms)", "Net(ms)", "Total(ms)", "Comm(KB)")
+		fmt.Println("  " + rpt("─", 98))
 
 		var rows []row
 		for _, cfg := range configs {
 			r := runConfig(cfg.T, cfg.N, hspCRS, pgpCRS, prof)
-			fmt.Printf("  %-14s %8d %12d %10d %10d %10d\n",
+			fmt.Printf("  %-14s %8d %10d %8d %8d %8d %8d %10d %10.2f\n",
 				fmt.Sprintf("%d-of-%d", cfg.T, cfg.N),
-				r.RcMs, r.AttestMs, r.SignMs, r.NetMs, r.TotalMs)
+				r.DkgMs, r.RcSessMs, r.HspMs, r.PgpMs, r.SignMs, r.NetMs, r.TotalMs, r.CommKB)
 			rows = append(rows, r)
 		}
 		fmt.Println()
@@ -229,8 +271,8 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		}
 	}
 
-	// ── RC: DVRF ─────────────────────────────────────────────────────────
-	t0 := time.Now()
+	// ── RC: DKG setup ────────────────────────────────────────────────────
+	tDkg := time.Now()
 	dkgOuts, err := dvrf.RunDKG(n, t)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dvrf DKG:", err)
@@ -238,7 +280,10 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 	}
 	// DKG: 3 broadcast rounds among n parties (6 one-way hops)
 	sleep(6)
+	dkgMs := time.Since(tDkg).Milliseconds()
 
+	// ── RC: DVRF session (PartialEval + Combine, keys already established) ──
+	tSess := time.Now()
 	var partials []*dvrf.Eval
 	for i := 0; i < t; i++ {
 		pe, err := dvrf.PartialEval(&dkgOuts[i].Participant, alpha)
@@ -268,12 +313,13 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		fmt.Fprintln(os.Stderr, "dvrf.Verify failed")
 		os.Exit(1)
 	}
-	rcMs := time.Since(t0).Milliseconds()
+	rcSessMs := time.Since(tSess).Milliseconds()
 	rand32 := dvrfOut.Rand
 
-	// ── Attestation: dx-DCTLS ────────────────────────────────────────────
-	t1 := time.Now()
+	// ── Attestation: HSP (co-SNARK TLS-PRF) ──────────────────────────────
+	var hspMs, pgpMs int64
 	if hspCRS != nil {
+		tHsp := time.Now()
 		// TLS 1.2 full handshake: 2 RTTs (4 one-way hops)
 		sleep(4)
 
@@ -285,7 +331,10 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 
 		// co-SNARK ExecuteSplit: commit (2 hops) + reveal (2 hops)
 		sleep(4)
+		hspMs = time.Since(tHsp).Milliseconds()
 
+		// ── Attestation: PGP (DECO ZKP) ──────────────────────────────────
+		tPgp := time.Now()
 		qr := deco.QP(sess, []byte("GET /oracle"), []byte(`{"v":1}`))
 
 		// QP: query + oracle response (1 RTT = 2 hops)
@@ -304,8 +353,8 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 			fmt.Fprintln(os.Stderr, "VerifyDxDctlsProof:", err)
 			os.Exit(1)
 		}
+		pgpMs = time.Since(tPgp).Milliseconds()
 	}
-	attestMs := time.Since(t1).Milliseconds()
 
 	// ── Signing: FROST ───────────────────────────────────────────────────
 	t2 := time.Now()
@@ -379,16 +428,20 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 	}
 	onchainMs := time.Since(t3).Milliseconds()
 
-	totalMs := rcMs + attestMs + signMs + onchainMs
+	totalMs := dkgMs + rcSessMs + hspMs + pgpMs + signMs + onchainMs
+	sessKB, _ := commCostKB(t, n)
 
 	return row{
 		Config:    fmt.Sprintf("%d-of-%d", t, n),
-		RcMs:      rcMs,
-		AttestMs:  attestMs,
+		DkgMs:     dkgMs,
+		RcSessMs:  rcSessMs,
+		HspMs:     hspMs,
+		PgpMs:     pgpMs,
 		SignMs:    signMs,
 		OnchainMs: onchainMs,
 		NetMs:     totalNetMs,
 		TotalMs:   totalMs,
+		CommKB:    sessKB,
 	}
 }
 
@@ -398,5 +451,12 @@ func rpt(s string, n int) string {
 		out += s
 	}
 	return out
+}
+
+func max1(a int64) int64 {
+	if a < 1 {
+		return 1
+	}
+	return a
 }
 
