@@ -1,8 +1,9 @@
 // Package deco implements dx-DCTLS attestation (§VIII of the paper).
 //
 // HSP: ECDH ephemeral handshake → K_MAC derivation via TLS 1.2 PRF →
-//      (K^P_MAC, K^V_MAC) split → co-SNARK commit-then-reveal → π_HSP.
-//      Verification of π_HSP is performed with a real Groth16.Verify call.
+//
+//	(K^P_MAC, K^V_MAC) split → co-SNARK commit-then-reveal → π_HSP.
+//	Verification of π_HSP is performed with a real Groth16.Verify call.
 //
 // QP:  Transcript commitment via HMAC-SHA256(K_MAC, Q||R).
 //
@@ -31,6 +32,7 @@ import (
 	"github.com/consensys/gnark/constraint"
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/r1cs"
+	"github.com/consensys/gnark/std/math/uints"
 
 	"github.com/CanDenizGokgedik/tls-gnark/internal/circuit"
 	"github.com/CanDenizGokgedik/tls-gnark/internal/cosnark"
@@ -53,9 +55,9 @@ type HspProof struct {
 	KMacCommit     [32]byte // SHA256("cosnark/k-mac/v1" || kMac)
 	SessionBinding [32]byte // H(sid || rand || kMacCommit || certHash)
 	// Groth16 public inputs — required for verification.
-	CommitFe  []byte // big.Int bytes: pack(pShare)+pack(vShare)+pack(rand32)
-	RandFe    []byte // big.Int bytes: pack(rand32)
-	ProveMs   int64
+	CommitFe []byte // big.Int bytes: pack(pShare)+pack(vShare)+pack(rand32)
+	RandFe   []byte // big.Int bytes: pack(rand32)
+	ProveMs  int64
 }
 
 // Session holds the full dx-DCTLS session state after HSP.
@@ -64,6 +66,7 @@ type Session struct {
 	KMacP      [32]byte // prover's share
 	KMacV      [32]byte // verifier's share
 	KMac       [32]byte // KMacP XOR KMacV — known only to the coordinator
+	KEnc       [16]byte // AES-128 encryption key (sim-derived)
 	KMacCommit [32]byte
 	PMS        [32]byte // ECDH pre-master secret
 	ClientRand [32]byte
@@ -76,18 +79,23 @@ type Session struct {
 // QueryRecord is the QP output.
 type QueryRecord struct {
 	SessionID            [16]byte
-	TranscriptCommitment [32]byte // HMAC-SHA256(K_MAC, Q||R)
-	RawMsg               []byte   // Q||R — kept for PGP witness generation
+	TranscriptCommitment [32]byte
+	RawMsg               []byte
+	PgpAssign            *circuit.PgpCircuit
+	Si                   [8]uint64
+	IvLast3rd            [16]byte
+	ExpectCt             [48]byte
+	OnChainCommit        [32]byte
 }
 
 // DVRFBundle holds the DVRF output and all data needed for verification.
 // VerifyDxDctlsProof uses this to run DVRF.Verify.
 type DVRFBundle struct {
-	Output *dvrf.Output           // combined output from Combine()
-	Evals  []*dvrf.Eval           // each participant's partial evaluation
-	VKs    []secp256k1.G1Affine  // each participant's verification key
-	GK     *dvrf.GroupKey        // group public key
-	Alpha  [32]byte              // input to DVRF (session nonce)
+	Output *dvrf.Output         // combined output from Combine()
+	Evals  []*dvrf.Eval         // each participant's partial evaluation
+	VKs    []secp256k1.G1Affine // each participant's verification key
+	GK     *dvrf.GroupKey       // group public key
+	Alpha  [32]byte             // input to DVRF (session nonce)
 }
 
 // PgpCRS holds the compiled constraint system and Groth16 keys for the PGP circuit.
@@ -110,9 +118,12 @@ type DxDctlsProof struct {
 	ProofDigest  [32]byte
 	CrossBinding [32]byte
 	// PGP ZKP fields (real Groth16 proof).
-	PgpProofBytes []byte // serialised π_PGP
-	TCHi          []byte // TranscriptCommitment bytes[0:16] — Groth16 public input
-	TCLo          []byte // TranscriptCommitment bytes[16:32] — Groth16 public input
+	PgpProofBytes []byte
+	KMac          [32]byte // exported MAC key (verifier holds it; DECO MtE)
+	Si            [8]uint64
+	IvLast3rd     [16]byte
+	ExpectCt      [48]byte
+	OnChainCommit [32]byte
 	// DVRF fields (for Verify).
 	DVRF DVRFBundle
 }
@@ -282,16 +293,43 @@ func QP(sess *Session, query, response []byte) QueryRecord {
 	mac := circuit.HmacSha256Native(sess.KMac[:], msg)
 	var commit [32]byte
 	copy(commit[:], mac)
-	// Store raw message (capped at PgpMsgLen) for PGP witness generation.
-	raw := make([]byte, len(msg))
-	copy(raw, msg)
-	if len(raw) > circuit.PgpMsgLen {
-		raw = raw[:circuit.PgpMsgLen]
+
+	keFull := sha256.Sum256(append([]byte("sim/k-enc/v1\x00"), sess.KMac[:]...))
+	var kEnc [16]byte
+	copy(kEnc[:], keFull[:16])
+	sess.KEnc = kEnc
+
+	ivFull := sha256.Sum256(append([]byte("sim/iv-last3rd/v1\x00"), sess.SessionID[:]...))
+	var iv [16]byte
+	copy(iv[:], ivFull[:16])
+
+	plain := make([]byte, circuit.PgpPlainLen)
+	copy(plain, msg)
+	valOff := (circuit.PgpPrevLen - 64) + circuit.PgpValOff
+	copy(plain[valOff:valOff+circuit.PgpValLen], []byte("00038000"))
+
+	prefix := make([]byte, circuit.PgpPrefixLen)
+	copy(prefix, plain)
+	pad := make([]byte, circuit.PgpPadLen)
+	for i := range pad {
+		pad[i] = byte(circuit.PgpPadLen - 1)
 	}
+
+	in := circuit.PgpInputs{
+		KMac: sess.KMac, KEnc: kEnc, Plaintext: plain,
+		IvLast3rd: iv, Prefix3: prefix, Pad: pad, Threshold: 30000,
+	}
+	assign, pub, _ := circuit.BuildPgpAll(in)
+
 	return QueryRecord{
 		SessionID:            sess.SessionID,
 		TranscriptCommitment: commit,
-		RawMsg:               raw,
+		RawMsg:               msg,
+		PgpAssign:            assign,
+		Si:                   pub.Si,
+		IvLast3rd:            pub.IvLast3rd,
+		ExpectCt:             pub.ExpectCt,
+		OnChainCommit:        pub.OnChainCommit,
 	}
 }
 
@@ -339,19 +377,20 @@ func PGP(sess *Session, qr QueryRecord, statement []byte, pgpCRS *PgpCRS, dvrf_ 
 		proof.DVRF = *dvrf_
 	}
 
-	// Real Groth16 ZKP: HMAC-SHA256(K_MAC, Q||R) == TranscriptCommitment.
-	if pgpCRS != nil {
-		tc := qr.TranscriptCommitment
-		assignment := circuit.BuildPgpWitness(sess.KMac, qr.RawMsg, tc)
-		wit, werr := frontend.NewWitness(assignment, ecc.BLS12_381.ScalarField())
+	// Real Groth16 ZKP: full DECO PGP statement (HSP-bound, MtE, predicate, commit).
+	if pgpCRS != nil && qr.PgpAssign != nil {
+		wit, werr := frontend.NewWitness(qr.PgpAssign, ecc.BLS12_381.ScalarField())
 		if werr == nil {
 			p, perr := groth16.Prove(pgpCRS.CS, pgpCRS.PK, wit)
 			if perr == nil {
 				var buf bytes.Buffer
 				if _, serr := p.WriteTo(&buf); serr == nil {
 					proof.PgpProofBytes = buf.Bytes()
-					proof.TCHi = tc[:16]
-					proof.TCLo = tc[16:]
+					proof.KMac = sess.KMac
+					proof.Si = qr.Si
+					proof.IvLast3rd = qr.IvLast3rd
+					proof.ExpectCt = qr.ExpectCt
+					proof.OnChainCommit = qr.OnChainCommit
 				}
 			}
 		}
@@ -463,10 +502,27 @@ func VerifyDxDctlsProof(
 	}
 
 	// ── Condition 2: π_PGP Groth16 verification ──────────────────────────────
-	if pgpCRS != nil && len(p.PgpProofBytes) > 0 && len(p.TCHi) == 16 && len(p.TCLo) == 16 {
-		pubAssignment := &circuit.PgpCircuit{
-			TCHi: new(big.Int).SetBytes(p.TCHi),
-			TCLo: new(big.Int).SetBytes(p.TCLo),
+	if pgpCRS != nil && len(p.PgpProofBytes) > 0 {
+		// K_MAC verification: the exported K_MAC must match the HSP commitment,
+		// then π_PGP is verified against that exact K_MAC (public input).
+		if circuit.KMacCommitNative(p.KMac) != p.PiHSP.KMacCommit {
+			return fmt.Errorf("VerifyDxDctlsProof [Condition 2 — K_MAC does not match PiHSP.KMacCommit]")
+		}
+		pubAssignment := &circuit.PgpCircuit{}
+		for i := 0; i < 32; i++ {
+			pubAssignment.KMac[i] = uints.U8{Val: frontend.Variable(int(p.KMac[i]))}
+		}
+		for i := 0; i < 8; i++ {
+			pubAssignment.Si[i] = frontend.Variable(p.Si[i])
+		}
+		for i := 0; i < 16; i++ {
+			pubAssignment.IvLast3rd[i] = uints.U8{Val: frontend.Variable(int(p.IvLast3rd[i]))}
+		}
+		for i := 0; i < 48; i++ {
+			pubAssignment.ExpectCt[i] = uints.U8{Val: frontend.Variable(int(p.ExpectCt[i]))}
+		}
+		for i := 0; i < 32; i++ {
+			pubAssignment.OnChainCommit[i] = uints.U8{Val: frontend.Variable(int(p.OnChainCommit[i]))}
 		}
 		pgpProof := groth16.NewProof(ecc.BLS12_381)
 		if _, err := pgpProof.ReadFrom(bytes.NewReader(p.PgpProofBytes)); err != nil {
