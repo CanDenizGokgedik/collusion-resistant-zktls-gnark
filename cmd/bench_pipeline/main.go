@@ -49,26 +49,59 @@ var configs = []struct{ T, N int }{
 
 // ── Network simulation ────────────────────────────────────────────────────────
 
-// netProfile defines the one-way latency for a network condition.
-// RTT = 2 × oneWay.
+// netProfile defines a network condition using the Rust DVRF-then-Sign WAN model
+// (DVRF-then-Sign/benches/wan_simulation_bench.rs). JitterMs is reported only and
+// is NOT used in the delay formula, matching the deterministic reference.
 type netProfile struct {
-	Name   string
-	OneWay time.Duration // one-way message latency
+	Name          string
+	OneWayMs      float64 // one-way latency (ms); RTT = 2 × OneWayMs
+	JitterMs      float64 // reported only (unused in delay), as in the reference
+	BandwidthMbps float64
+	LossRate      float64
 }
 
 var netProfiles = map[string]netProfile{
-	"lan":  {"LAN", 0},
-	"wan1": {"WAN1", 20 * time.Millisecond}, // 40 ms RTT — continental
-	"wan2": {"WAN2", 50 * time.Millisecond}, // 100 ms RTT — intercontinental
+	"lan":  {"LAN", 0, 0, 0, 0},
+	"wan1": {"WAN1", 40, 5, 50, 0.001},  // 40 ms ± 5 ms, 50 Mbps, 0.1% loss
+	"wan2": {"WAN2", 75, 15, 20, 0.002}, // 75 ms ± 15 ms, 20 Mbps, 0.2% loss
 }
 
-// netSleep sleeps for `rounds` one-way message hops.
-// Use rounds=1 for 1 RTT (one message each way = 2 one-way hops).
-func netSleep(p netProfile, oneWayHops int) {
-	if p.OneWay == 0 || oneWayHops == 0 {
-		return
+func (p netProfile) rttMs() float64 { return 2 * p.OneWayMs }
+
+// phaseDelayMs = rounds·RTT + (bytes·8/1e6)/bw·1000 + msgs·loss·RTT  (Rust formula).
+func (p netProfile) phaseDelayMs(rounds, bytes, msgs uint64) int64 {
+	if p.OneWayMs == 0 {
+		return 0
 	}
-	time.Sleep(p.OneWay * time.Duration(oneWayHops))
+	latency := float64(rounds) * p.rttMs()
+	bandwidth := (float64(bytes*8) / 1_000_000.0 / p.BandwidthMbps) * 1000.0
+	loss := float64(msgs) * p.LossRate * p.rttMs()
+	return int64(latency + bandwidth + loss + 0.5)
+}
+
+// latencyDelayMs = rounds·RTT only, for dx-DCTLS rounds with no byte model.
+func (p netProfile) latencyDelayMs(rounds uint64) int64 {
+	if p.OneWayMs == 0 {
+		return 0
+	}
+	return int64(float64(rounds)*p.rttMs() + 0.5)
+}
+
+// Per-phase cost = (round_count, total_bytes, message_count), matching the Rust
+// network_cost.rs total_cost() for DKG / DVRF / FROST. bytes = sent + received.
+func dkgNetCost(t, n int) (rounds, bytes, msgs uint64) {
+	N, T := uint64(n), uint64(t)
+	return 3, 2 * (N - 1) * (33*T + 144), 6 * N * (N - 1)
+}
+
+func dvrfNetCost(t int) (rounds, bytes, msgs uint64) {
+	T := uint64(t)
+	return 1, 129 * T, T * T
+}
+
+func frostNetCost(t int) (rounds, bytes, msgs uint64) {
+	T := uint64(t)
+	return 2, 98*T + 64, 2*T*T + T
 }
 
 // ── Result types ──────────────────────────────────────────────────────────────
@@ -191,7 +224,7 @@ func main() {
 	var allResults []netResult
 
 	for _, prof := range profiles {
-		fmt.Printf("  ══ Network: %s (one-way latency: %v) ══\n\n", prof.Name, prof.OneWay)
+		fmt.Printf("  ══ Network: %s (one-way %.0f ms, %.0f Mbps, %.1f%% loss) ══\n\n", prof.Name, prof.OneWayMs, prof.BandwidthMbps, prof.LossRate*100)
 		fmt.Printf("  %-14s %8s %9s %8s %8s %8s %8s %10s %10s\n",
 			"Config", "DKG(ms)", "RCSess(ms)", "HSP(ms)", "PGP(ms)", "Sign(ms)", "Net(ms)", "Total(ms)", "Comm(KB)")
 		fmt.Println("  " + rpt("─", 98))
@@ -263,13 +296,15 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 	certHash[0] = 0xCE
 	var totalNetMs int64
 
-	sleep := func(hops int) {
-		if net.OneWay > 0 && hops > 0 {
-			d := net.OneWay * time.Duration(hops)
-			totalNetMs += d.Milliseconds()
-			time.Sleep(d)
-		}
-	}
+	// Analytical WAN delays per phase (Rust DVRF-then-Sign cost model). LAN → 0.
+	netDKG := net.phaseDelayMs(dkgNetCost(t, n))
+	netDVRF := net.phaseDelayMs(dvrfNetCost(t))
+	netFROST := net.phaseDelayMs(frostNetCost(t))
+	// dx-DCTLS rounds are not in the reference cost model -> latency-only.
+	// Set these to 0 to make net_ms match the paper's DVRF-then-Sign WAN figure exactly.
+	netHSP := net.latencyDelayMs(4) // TLS handshake (2 RTT) + co-SNARK (2 RTT)
+	netQP := net.latencyDelayMs(1)  // query/response (1 RTT)
+	totalNetMs = netDKG + netDVRF + netFROST + netHSP + netQP
 
 	// ── RC: DKG setup ────────────────────────────────────────────────────
 	tDkg := time.Now()
@@ -278,9 +313,7 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		fmt.Fprintln(os.Stderr, "dvrf DKG:", err)
 		os.Exit(1)
 	}
-	// DKG: 3 broadcast rounds among n parties (6 one-way hops)
-	sleep(6)
-	dkgMs := time.Since(tDkg).Milliseconds()
+	dkgMs := time.Since(tDkg).Milliseconds() + netDKG
 
 	// ── RC: DVRF session (PartialEval + Combine, keys already established) ──
 	tSess := time.Now()
@@ -297,9 +330,6 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		}
 		partials = append(partials, pe)
 	}
-	// PartialEval: 1 RTT (t evaluators respond in parallel)
-	sleep(2)
-
 	dvrfOut, err := dvrf.Combine(partials, alpha)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "dvrf combine:", err)
@@ -313,32 +343,24 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		fmt.Fprintln(os.Stderr, "dvrf.Verify failed")
 		os.Exit(1)
 	}
-	rcSessMs := time.Since(tSess).Milliseconds()
+	rcSessMs := time.Since(tSess).Milliseconds() + netDVRF
 	rand32 := dvrfOut.Rand
 
 	// ── Attestation: HSP (co-SNARK TLS-PRF) ──────────────────────────────
 	var hspMs, pgpMs int64
 	if hspCRS != nil {
 		tHsp := time.Now()
-		// TLS 1.2 full handshake: 2 RTTs (4 one-way hops)
-		sleep(4)
-
 		sess, err := deco.HSP(hspCRS, rand32, certHash)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "deco HSP:", err)
 			os.Exit(1)
 		}
 
-		// co-SNARK ExecuteSplit: commit (2 hops) + reveal (2 hops)
-		sleep(4)
-		hspMs = time.Since(tHsp).Milliseconds()
+		hspMs = time.Since(tHsp).Milliseconds() + netHSP
 
 		// ── Attestation: PGP (DECO ZKP) ──────────────────────────────────
 		tPgp := time.Now()
 		qr := deco.QP(sess, []byte("GET /oracle"), []byte(`{"v":1}`))
-
-		// QP: query + oracle response (1 RTT = 2 hops)
-		sleep(2)
 
 		dvrf_bundle := &deco.DVRFBundle{
 			Output: dvrfOut,
@@ -353,7 +375,7 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 			fmt.Fprintln(os.Stderr, "VerifyDxDctlsProof:", err)
 			os.Exit(1)
 		}
-		pgpMs = time.Since(tPgp).Milliseconds()
+		pgpMs = time.Since(tPgp).Milliseconds() + netQP
 	}
 
 	// ── Signing: FROST ───────────────────────────────────────────────────
@@ -384,9 +406,6 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		nonces = append(nonces, no)
 		commitments = append(commitments, cm)
 	}
-	// FROST Round1: t parties broadcast commitments (1 RTT = 2 hops)
-	sleep(2)
-
 	var shares []*frost.SignatureShare
 	for i := 0; i < t; i++ {
 		sh, err := frost.Round2(&frostOuts[i].Signer, nonces[i], commitments, msg)
@@ -401,9 +420,6 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		}
 		shares = append(shares, sh)
 	}
-	// FROST Round2: t parties broadcast shares (1 RTT = 2 hops)
-	sleep(2)
-
 	sig, err := frost.Aggregate(commitments, shares, msg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "frost agg:", err)
@@ -413,7 +429,7 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		fmt.Fprintln(os.Stderr, "frost verify failed")
 		os.Exit(1)
 	}
-	signMs := time.Since(t2).Milliseconds()
+	signMs := time.Since(t2).Milliseconds() + netFROST
 
 	// ── On-chain: SC.Verify(σ, pk) ───────────────────────────────────────
 	t3 := time.Now()

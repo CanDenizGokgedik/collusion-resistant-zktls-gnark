@@ -301,7 +301,7 @@ func runPipelineOnce(t testing.TB, thresh, n int) (rcMs, attestMs, signMs int64)
 	}
 	qr := deco.QP(sess, []byte("GET /oracle"), []byte(`{"v":1}`))
 	piAttest := deco.PGP(sess, qr, []byte("v==1"), benchPgpCRS, dvrf_bundle)
-	if err := deco.VerifyDxDctlsProof(piAttest, benchHspCRS, benchPgpCRS, dvrfOut.Rand, certHash); err != nil {
+	if err := deco.VerifyDxDctlsProof(piAttest, benchHspCRS, benchPgpCRS, dvrfOut.Rand, certHash, sess.KMac); err != nil {
 		t.Fatal("VerifyDxDctlsProof:", err)
 	}
 	attestMs = time.Since(t1).Milliseconds()

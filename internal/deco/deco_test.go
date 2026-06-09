@@ -199,7 +199,7 @@ func TestPGP_ZKP_Verify(t *testing.T) {
 	}
 
 	// VerifyDxDctlsProof — Condition 1 + Condition 2 (Condition 3 skipped without DVRF bundle).
-	if err := deco.VerifyDxDctlsProof(proof, decosCRS, pgpCRS, mock.Nonce, mock.CertHash); err != nil {
+	if err := deco.VerifyDxDctlsProof(proof, decosCRS, pgpCRS, mock.Nonce, mock.CertHash, sess.KMac); err != nil {
 		t.Fatalf("VerifyDxDctlsProof failed: %v", err)
 	}
 	t.Log("VerifyDxDctlsProof (Condition 1 + 2): OK")
@@ -286,7 +286,7 @@ func TestVerifyDxDctlsProof_WithDVRF(t *testing.T) {
 	proof := deco.PGP(sess, qr, []byte("v==1"), pgpCRS, dvrf_bundle)
 
 	// ── VerifyDxDctlsProof: all three conditions ─────────────────────────────
-	if err := deco.VerifyDxDctlsProof(proof, decosCRS, pgpCRS, vrfOut.Rand, mock.CertHash); err != nil {
+	if err := deco.VerifyDxDctlsProof(proof, decosCRS, pgpCRS, vrfOut.Rand, mock.CertHash, sess.KMac); err != nil {
 		t.Fatalf("VerifyDxDctlsProof (all conditions): %v", err)
 	}
 	t.Log("VerifyDxDctlsProof (Condition 1 + 2 + 3 — including DVRF): OK")
