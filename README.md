@@ -15,7 +15,7 @@ across both implementations.
 quick run:
 
 ```
-go run ./cmd/bench_pipeline --mode prf
+go run ./cmd/bench_pipeline --mode prf --net all
 
 ```
 
