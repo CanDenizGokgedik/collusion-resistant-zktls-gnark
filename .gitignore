@@ -38,3 +38,4 @@ vendor/
 # Logs
 *.log
 .deco-baseline/
+/bench_pipeline
