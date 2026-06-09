@@ -57,7 +57,11 @@ type HspProof struct {
 	// Groth16 public inputs — required for verification.
 	CommitFe []byte // big.Int bytes: pack(pShare)+pack(vShare)+pack(rand32)
 	RandFe   []byte // big.Int bytes: pack(rand32)
-	ProveMs  int64
+	// ModeCoSNARK public inputs (Zp is public per paper §VIII.C).
+	Zp [32]byte // ECDH pre-master secret (known to aux verifiers)
+	CR [32]byte // TLS ClientRandom
+	SR [32]byte // TLS ServerRandom
+	ProveMs int64
 }
 
 // Session holds the full dx-DCTLS session state after HSP.
@@ -231,13 +235,17 @@ func HSP(crs *cosnark.CRS, rand32, certHash [32]byte) (*Session, error) {
 	}
 
 	// Step 7: co-SNARK → π_HSP.
-	// ModeKey: genuine distributed MSM (each party knows only its own scalar).
-	// ModePRF: TLS-PRF HMAC chain requires central proving; ExecuteSplit is used.
+	// ModeKey:    genuine distributed MSM on TlsKeyCircuit (2 private wires).
+	// ModeCoSNARK: paper §VIII.C — Zp public, distributed MSM on TlsPrfCoSnarkCircuit.
+	// ModePRF:    central fallback (full TLS-PRF, trusted coordinator).
 	t0 := time.Now()
 	var mpcRes *cosnark.MpcResult
-	if crs.Mode == cosnark.ModeKey {
+	switch crs.Mode {
+	case cosnark.ModeKey:
 		mpcRes, err = cosnark.ExecuteDistributedMSM(crs, pShare, vShare, rand32)
-	} else {
+	case cosnark.ModeCoSNARK:
+		mpcRes, err = cosnark.ExecuteDistributedPRF(crs, pShare, vShare, rand32, pms, clientRandom, serverRandom)
+	default:
 		mpcRes, err = cosnark.ExecuteSplit(crs, pShare, vShare, rand32, pms, clientRandom, serverRandom)
 	}
 	if err != nil {
@@ -266,6 +274,9 @@ func HSP(crs *cosnark.CRS, rand32, certHash [32]byte) (*Session, error) {
 		SessionBinding: binding,
 		CommitFe:       commitFe.Bytes(),
 		RandFe:         randFe.Bytes(),
+		Zp:             pms,
+		CR:             clientRandom,
+		SR:             serverRandom,
 		ProveMs:        mpcRes.ProveMs,
 	}
 
@@ -436,12 +447,29 @@ func VerifyHSP(crs *cosnark.CRS, pi HspProof, rand32, certHash [32]byte) error {
 	randFe := new(big.Int).SetBytes(pi.RandFe)
 
 	var pubAssignment frontend.Circuit
-	if crs.Mode == cosnark.ModeKey {
+	switch crs.Mode {
+	case cosnark.ModeKey:
 		pubAssignment = &circuit.TlsKeyCircuit{
 			Commitment:  commitFe,
 			RandBinding: randFe,
 		}
-	} else {
+	case cosnark.ModeCoSNARK:
+		// Zp, CR, SR are public — aux verifiers can reconstruct them.
+		csCirc := &circuit.TlsPrfCoSnarkCircuit{
+			Commitment:  commitFe,
+			RandBinding: randFe,
+		}
+		for i, b := range pi.Zp {
+			csCirc.Zp[i].Val = frontend.Variable(int(b))
+		}
+		for i, b := range pi.CR {
+			csCirc.CR[i].Val = frontend.Variable(int(b))
+		}
+		for i, b := range pi.SR {
+			csCirc.SR[i].Val = frontend.Variable(int(b))
+		}
+		pubAssignment = csCirc
+	default:
 		pubAssignment = &circuit.TlsPrfCircuit{
 			Commitment:  commitFe,
 			RandBinding: randFe,

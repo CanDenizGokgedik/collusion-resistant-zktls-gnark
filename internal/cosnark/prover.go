@@ -21,8 +21,9 @@ import (
 type Mode int
 
 const (
-	ModeKey Mode = iota // K_MAC split only (~769 R1CS)
-	ModePRF             // full TLS-PRF (~1.5 M R1CS)
+	ModeKey    Mode = iota // K_MAC split only (~769 R1CS)
+	ModePRF                // full TLS-PRF (~1.5 M R1CS)
+	ModeCoSNARK            // paper §VIII.C: Zp public, 2 private shares, ~56k R1CS
 )
 
 // CRS holds the compiled constraint system and Groth16 keys.
@@ -42,9 +43,12 @@ type ProveResult struct {
 // Setup compiles the circuit and generates Groth16 keys.
 func Setup(mode Mode) (*CRS, int64, error) {
 	var circ frontend.Circuit
-	if mode == ModeKey {
+	switch mode {
+	case ModeKey:
 		circ = &circuit.TlsKeyCircuit{}
-	} else {
+	case ModeCoSNARK:
+		circ = &circuit.TlsPrfCoSnarkCircuit{}
+	default:
 		circ = &circuit.TlsPrfCircuit{}
 	}
 
