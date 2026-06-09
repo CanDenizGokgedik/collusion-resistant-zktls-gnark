@@ -12,7 +12,7 @@ The communication cost model and cryptographic protocol are equivalent
 across both implementations.
 
 
-quick run:
+quick run (LAN, WAN1 and WAN2 settings):
 
 ```
 go run ./cmd/bench_pipeline --mode prf --net all
