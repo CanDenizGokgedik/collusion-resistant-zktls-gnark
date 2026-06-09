@@ -2,7 +2,6 @@
 //
 // Proves, in zero knowledge:
 //
-//	(0) SHA256("cosnark/k-mac/v1\0" || K_MAC) == KMacCommit        [HSP binding]
 //	(1) inner = SHA256_continue(Si, Suffix)  (DECO s_i mid-state trick)
 //	    mac   = SHA256( (K_MAC^opad) || inner )                    [HMAC, redacted]
 //	(2) value(Suffix) >= Threshold  and  SHA256(Threshold) == OnChainCommit
@@ -41,8 +40,6 @@ const (
 	PgpPrefixLen = 48 - 32 - PgpPadLen // = 3
 )
 
-var kMacCommitDomain = []byte("cosnark/k-mac/v1\x00")
-
 // PgpCircuit is the full DECO PGP statement.
 type PgpCircuit struct {
 	KMac          [32]uints.U8           `gnark:",public"` // verifier holds K_MAC (DECO MtE)
@@ -74,9 +71,9 @@ func (c *PgpCircuit) Define(api frontend.API) error {
 		return err
 	}
 
-	// (0) K_MAC is a PUBLIC input: the verifier supplies the K_MAC it obtained
-	// from HSP, so π_PGP only verifies against that exact key. (The verifier also
-	// checks SHA256(domain||K_MAC) == PiHSP.KMacCommit natively — see deco.go.)
+	// K_MAC is a PUBLIC input: the verifier supplies the K_MAC it already holds
+	// (from HSP / handshake), so π_PGP verifies only against that exact key — no
+	// commitment, matching the DECO reference (keyMac is a public circuit input).
 
 	// (1) inner = continue(Si, Suffix); mac = SHA256(okey || inner).
 	var si [8]uints.U32
@@ -167,10 +164,6 @@ func (c *PgpCircuit) Define(api frontend.API) error {
 
 func u8b(b byte) uints.U8 { return uints.U8{Val: frontend.Variable(int(b))} }
 
-func KMacCommitNative(kMac [32]byte) [32]byte {
-	return sha256.Sum256(append(append([]byte{}, kMacCommitDomain...), kMac[:]...))
-}
-
 func AesCbcEncryptNative(key, iv, pt []byte) ([]byte, error) {
 	blk, err := aes.NewCipher(key)
 	if err != nil {
@@ -204,7 +197,6 @@ type PgpInputs struct {
 // PgpPublic holds the Groth16 public-input values for verification.
 type PgpPublic struct {
 	Si            [8]uint64
-	KMacCommit    [32]byte
 	IvLast3rd     [16]byte
 	ExpectCt      [48]byte
 	OnChainCommit [32]byte
@@ -233,7 +225,6 @@ func BuildPgpAll(in PgpInputs) (*PgpCircuit, PgpPublic, error) {
 	var thB [4]byte
 	binary.BigEndian.PutUint32(thB[:], in.Threshold)
 	onCommit := sha256.Sum256(thB[:])
-	commit := KMacCommitNative(in.KMac)
 
 	c := &PgpCircuit{}
 	for i := 0; i < 32; i++ {
@@ -268,7 +259,6 @@ func BuildPgpAll(in PgpInputs) (*PgpCircuit, PgpPublic, error) {
 	for i := 0; i < 8; i++ {
 		pub.Si[i] = uint64(si[i])
 	}
-	pub.KMacCommit = commit
 	pub.IvLast3rd = in.IvLast3rd
 	copy(pub.ExpectCt[:], ct)
 	pub.OnChainCommit = onCommit

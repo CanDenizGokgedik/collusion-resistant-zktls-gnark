@@ -52,12 +52,12 @@ var configs = []struct{ T, N int }{
 // netProfile defines the one-way latency for a network condition.
 // RTT = 2 × oneWay.
 type netProfile struct {
-	Name    string
-	OneWay  time.Duration // one-way message latency
+	Name   string
+	OneWay time.Duration // one-way message latency
 }
 
 var netProfiles = map[string]netProfile{
-	"lan":  {"LAN",  0},
+	"lan":  {"LAN", 0},
 	"wan1": {"WAN1", 20 * time.Millisecond}, // 40 ms RTT — continental
 	"wan2": {"WAN2", 50 * time.Millisecond}, // 100 ms RTT — intercontinental
 }
@@ -75,15 +75,15 @@ func netSleep(p netProfile, oneWayHops int) {
 
 type row struct {
 	Config    string  `json:"config"`
-	DkgMs     int64   `json:"dkg_ms"`      // DKG setup (one-time per deployment)
-	RcSessMs  int64   `json:"rc_sess_ms"`  // PartialEval + Combine, no DKG
-	HspMs     int64   `json:"hsp_ms"`      // co-SNARK TLS-PRF proof
-	PgpMs     int64   `json:"pgp_ms"`      // DECO PGP ZKP proof
-	SignMs    int64   `json:"sign_ms"`     // FROST threshold signature
-	OnchainMs int64   `json:"onchain_ms"`  // on-chain verification
-	NetMs     int64   `json:"net_ms"`      // total injected network delay
-	TotalMs   int64   `json:"total_ms"`    // DKG + RcSess + Hsp + Pgp + Sign + Onchain
-	CommKB    float64 `json:"comm_kb"`     // analytical communication cost (KB)
+	DkgMs     int64   `json:"dkg_ms"`     // DKG setup (one-time per deployment)
+	RcSessMs  int64   `json:"rc_sess_ms"` // PartialEval + Combine, no DKG
+	HspMs     int64   `json:"hsp_ms"`     // co-SNARK TLS-PRF proof
+	PgpMs     int64   `json:"pgp_ms"`     // DECO PGP ZKP proof
+	SignMs    int64   `json:"sign_ms"`    // FROST threshold signature
+	OnchainMs int64   `json:"onchain_ms"` // on-chain verification
+	NetMs     int64   `json:"net_ms"`     // total injected network delay
+	TotalMs   int64   `json:"total_ms"`   // DKG + RcSess + Hsp + Pgp + Sign + Onchain
+	CommKB    float64 `json:"comm_kb"`    // analytical communication cost (KB)
 }
 
 // ── Communication cost model ──────────────────────────────────────────────────
@@ -225,7 +225,7 @@ func main() {
 	fmt.Println("\nJSON:")
 	fmt.Println(string(j))
 
-	}
+}
 
 // ── runConfig ────────────────────────────────────────────────────────────────
 //
@@ -349,7 +349,7 @@ func runConfig(t, n int, hspCRS *cosnark.CRS, pgpCRS *deco.PgpCRS, net netProfil
 		}
 		piAttest := deco.PGP(sess, qr, []byte("v==1"), pgpCRS, dvrf_bundle)
 
-		if err := deco.VerifyDxDctlsProof(piAttest, hspCRS, pgpCRS, rand32, certHash); err != nil {
+		if err := deco.VerifyDxDctlsProof(piAttest, hspCRS, pgpCRS, rand32, certHash, sess.KMac); err != nil {
 			fmt.Fprintln(os.Stderr, "VerifyDxDctlsProof:", err)
 			os.Exit(1)
 		}
@@ -459,4 +459,3 @@ func max1(a int64) int64 {
 	}
 	return a
 }
-

@@ -119,7 +119,6 @@ type DxDctlsProof struct {
 	CrossBinding [32]byte
 	// PGP ZKP fields (real Groth16 proof).
 	PgpProofBytes []byte
-	KMac          [32]byte // exported MAC key (verifier holds it; DECO MtE)
 	Si            [8]uint64
 	IvLast3rd     [16]byte
 	ExpectCt      [48]byte
@@ -386,7 +385,6 @@ func PGP(sess *Session, qr QueryRecord, statement []byte, pgpCRS *PgpCRS, dvrf_ 
 				var buf bytes.Buffer
 				if _, serr := p.WriteTo(&buf); serr == nil {
 					proof.PgpProofBytes = buf.Bytes()
-					proof.KMac = sess.KMac
 					proof.Si = qr.Si
 					proof.IvLast3rd = qr.IvLast3rd
 					proof.ExpectCt = qr.ExpectCt
@@ -495,6 +493,7 @@ func VerifyDxDctlsProof(
 	hspCRS *cosnark.CRS,
 	pgpCRS *PgpCRS,
 	rand32, certHash [32]byte,
+	verifierKMac [32]byte, // K_MAC the verifier already holds (from HSP / handshake)
 ) error {
 	// ── Condition 1: π_HSP Groth16 verification ──────────────────────────────
 	if err := VerifyHSP(hspCRS, p.PiHSP, rand32, certHash); err != nil {
@@ -503,14 +502,12 @@ func VerifyDxDctlsProof(
 
 	// ── Condition 2: π_PGP Groth16 verification ──────────────────────────────
 	if pgpCRS != nil && len(p.PgpProofBytes) > 0 {
-		// K_MAC verification: the exported K_MAC must match the HSP commitment,
-		// then π_PGP is verified against that exact K_MAC (public input).
-		if circuit.KMacCommitNative(p.KMac) != p.PiHSP.KMacCommit {
-			return fmt.Errorf("VerifyDxDctlsProof [Condition 2 — K_MAC does not match PiHSP.KMacCommit]")
-		}
+		// The verifier feeds the K_MAC it already holds as a public input, so the
+		// proof verifies only if the prover used that exact key (DECO MtE: K_MAC is
+		// known to the verifier; no commitment of K_MAC is involved).
 		pubAssignment := &circuit.PgpCircuit{}
 		for i := 0; i < 32; i++ {
-			pubAssignment.KMac[i] = uints.U8{Val: frontend.Variable(int(p.KMac[i]))}
+			pubAssignment.KMac[i] = uints.U8{Val: frontend.Variable(int(verifierKMac[i]))}
 		}
 		for i := 0; i < 8; i++ {
 			pubAssignment.Si[i] = frontend.Variable(p.Si[i])
