@@ -1,3 +1,24 @@
+The initial DVRF and TSS prototype was developed in Rust and is available at
+https://github.com/seugu/DVRF-then-Sign. That implementation uses the
+`frost-secp256k1-evm` crate for threshold Schnorr signing and a DDH-DVRF
+over secp256k1.
+
+This repository provides the complete end-to-end implementation of the
+Π_coll-min protocol — covering DDH-DVRF, FROST threshold signing, the
+DECO-based TLS attestation circuit (dx-DCTLS), and the full co-SNARK
+pipeline — reimplemented in Go to enable native integration with the
+[gnark](https://github.com/ConsenSys/gnark) zero-knowledge proof library.
+The communication cost model and cryptographic protocol are equivalent
+across both implementations.
+
+
+quick run:
+
+```
+go run ./cmd/bench_pipeline --mode prf
+
+```
+
 # tls-gnark
 
 End-to-end Go implementation of the **Π_coll-min dx-DCTLS** protocol from
